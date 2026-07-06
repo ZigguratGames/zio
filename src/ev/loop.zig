@@ -650,14 +650,20 @@ pub const Loop = struct {
     /// Completion callback for internal file ops with linked completion
     pub fn loopLinkedWorkComplete(ctx: ?*anyopaque, work: *Work) void {
         const context: *LinkedWorkContext = @ptrCast(@alignCast(ctx));
+        // Copy out of the context before publishing the linked completion:
+        // the context lives in the op's frame, and the push makes the
+        // completion consumable by the loop thread, which can finish the op
+        // and reuse that frame before the wake below runs.
+        const loop = context.loop;
+        const linked = context.linked;
         // Propagate cancel error from work to linked completion
         if (work.c.err) |err| {
-            if (!context.linked.has_result) {
-                context.linked.setError(err);
+            if (!linked.has_result) {
+                linked.setError(err);
             }
         }
-        context.loop.state.work_completions.push(context.linked);
-        context.loop.wake();
+        loop.state.work_completions.push(linked);
+        loop.wake();
     }
 
     pub fn processAsyncHandles(self: *Loop) void {
