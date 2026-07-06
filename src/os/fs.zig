@@ -1734,6 +1734,7 @@ pub fn errnoToFileReadError(err: E) FileReadError {
                 .NOMEM => error.SystemResources,
                 .BADF => error.NotOpenForReading,
                 .SPIPE => error.Unseekable,
+                .NXIO => error.Unseekable,
                 else => |e| unexpectedError(e),
             };
         },
@@ -1770,6 +1771,7 @@ pub fn errnoToFileWriteError(err: E) FileWriteError {
                 .DQUOT => error.DiskQuota,
                 .FBIG => error.FileTooBig,
                 .SPIPE => error.Unseekable,
+                .NXIO => error.Unseekable,
                 else => |e| unexpectedError(e),
             };
         },
@@ -3216,4 +3218,16 @@ fn ioctlWindows(handle: fd_t, code: std.os.windows.CTL_CODE, in: []const u8, out
         io_status.Information = 0;
     }
     return io_status;
+}
+
+test "positional read/write errno maps non-seekable devices to Unseekable" {
+    // std.Io.File.{Reader,Writer} rely on error.Unseekable from positional
+    // I/O to fall back to streaming mode. Pipes report ESPIPE, but character
+    // devices such as macOS ttys report ENXIO; both must map to Unseekable
+    // (matching std.Io.Threaded) or stdout writers crash on real terminals.
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    try std.testing.expectError(error.Unseekable, @as(FileReadError!void, errnoToFileReadError(.SPIPE)));
+    try std.testing.expectError(error.Unseekable, @as(FileReadError!void, errnoToFileReadError(.NXIO)));
+    try std.testing.expectError(error.Unseekable, @as(FileWriteError!void, errnoToFileWriteError(.SPIPE)));
+    try std.testing.expectError(error.Unseekable, @as(FileWriteError!void, errnoToFileWriteError(.NXIO)));
 }
