@@ -375,14 +375,18 @@ pub const AnyTask = struct {
 
     /// Re-arm cancellation after it was acknowledged.
     /// This increments pending_errors so the next cancellation point returns error.Canceled.
-    /// Asserts that user_canceled is already set.
+    /// Asserts that a cancellation source is still armed: either user
+    /// cancellation, or an auto-cancel whose flag has not been consumed by
+    /// AutoCancel.check yet (checkCancel consumes only the pending error, so
+    /// the flag is still set when a wait path re-arms a timeout-originated
+    /// cancellation).
     pub fn recancel(self: *AnyTask) void {
         var current = self.canceled_status.load(.acquire);
         while (true) {
             var status: CanceledStatus = @bitCast(current);
 
             // Must have been canceled already
-            std.debug.assert(status.user_canceled);
+            std.debug.assert(status.user_canceled or status.auto_canceled > 0);
 
             // Increment pending_errors
             status.pending_errors += 1;

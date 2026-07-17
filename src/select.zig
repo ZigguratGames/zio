@@ -441,6 +441,13 @@ fn waitInternal(future: anytype, comptime flags: WaitFlags) Cancelable!WaitResul
                 // On cancellation, cancel child and wait for completion
                 fut.cancel();
                 waiter.wait(1, .no_cancel);
+                // This path returns the child's result, not error.Canceled,
+                // so the caller cannot observe the cancellation here — leave
+                // it pending for the caller's next cancellation point instead
+                // of silently consuming it. (error.Canceled implies a task
+                // context: thread waiters park on a futex and are never
+                // canceled.)
+                getCurrentTask().recancel();
                 const result = if (has_context) fut.getResult(&context) else fut.getResult();
                 return .{ .value = result };
             },
@@ -473,6 +480,8 @@ pub fn wait(future: anytype) Cancelable!WaitResult(FutureResult(@TypeOf(future))
 /// Wait for a single future to complete, never propagating cancellation.
 /// When canceled, cancels the child task and continues waiting with shield enabled.
 /// This ensures the function always returns a result and never returns error.Canceled.
+/// A cancellation consumed while waiting stays pending on the calling task, so
+/// its next cancellation point still returns error.Canceled.
 /// `future` must be a pointer to a future type.
 /// Works from both coroutines and threads.
 ///
@@ -929,4 +938,41 @@ test "select: wait on JoinHandle from spawned task" {
 
     // Both should be valid results, though timing determines which completes first
     try std.testing.expect(std.meta.activeTag(result) == .first or std.meta.activeTag(result) == .second);
+}
+
+test "waitUntilComplete: consumed cancellation stays pending on the caller" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Tasks = struct {
+        fn child(rt: *Runtime) i32 {
+            // Canceled by the parent's cancel-and-continue wait.
+            rt.sleep(.fromMilliseconds(10_000)) catch return -1;
+            return 1;
+        }
+
+        fn parent(rt: *Runtime, saw_pending_cancel: *bool) !void {
+            var handle = try rt.spawn(child, .{rt});
+            // join() waits via waitUntilComplete: when this task is canceled,
+            // the wait cancels the child and returns the child's result
+            // instead of error.Canceled...
+            const child_result = handle.join();
+            try std.testing.expectEqual(@as(i32, -1), child_result);
+            // ...but it must not swallow the cancellation: the next
+            // cancellation point still has to report it.
+            rt.sleep(.fromMilliseconds(1)) catch |err| switch (err) {
+                error.Canceled => saw_pending_cancel.* = true,
+            };
+        }
+    };
+
+    var saw_pending_cancel = false;
+    var handle = try runtime.spawn(Tasks.parent, .{ runtime, &saw_pending_cancel });
+
+    // Let the parent park inside join(), then cancel it.
+    try runtime.sleep(.fromMilliseconds(20));
+    handle.cancel();
+    try handle.join();
+
+    try std.testing.expect(saw_pending_cancel);
 }
