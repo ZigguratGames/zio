@@ -1,0 +1,29 @@
+src/io.zig
+  s_727997faf8b15e::t_a56a314a68c88e 2873-2893
+  s_727997faf8b15e::t_4d84642826510b 2870-2872
+  s_727997faf8b15e::t_59bae1464ea0a4 2894-2896
+  s_727997faf8b15e::t_ddac425248ecff 1936-1938
+src/net.zig
+  s_727997faf8b15e::t_ba46c351dcc739 909-916
+  s_727997faf8b15e::t_2a2fd5fe599c9a 1704
+src/ev/sockreg.zig
+  s_727997faf8b15e::t_21378593cde769 108
+src/runtime.zig
+  s_727997faf8b15e::t_fdb85c9ce6162a 1467
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.14",
+  "base_commit_sha": "bd564519168b7697e04446816f75cc3944994051",
+  "prompts": {},
+  "sessions": {
+    "s_727997faf8b15e": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_094768e81ffevgZ7lhVwBQZssJ",
+        "model": "anthropic/claude-fable-5"
+      },
+      "human_author": "Shroom <68300730+ezShroom@users.noreply.github.com>"
+    }
+  }
+}
