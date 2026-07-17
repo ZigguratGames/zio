@@ -1788,12 +1788,17 @@ fn netListenIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io
     }
 
     if (options.reuse_address) {
+        // Deliberate divergence from upstream std.Io semantics: std documents
+        // `reuse_address` as setting both SO_REUSEADDR and SO_REUSEPORT on
+        // POSIX (and std.Io.Threaded does). REUSEPORT lets an unrelated
+        // process silently bind an already-served TCP port, after which the
+        // kernel splits accepted connections between the listeners — a
+        // debugging disaster that no server intends by "reuse address".
+        // Here `reuse_address` means SO_REUSEADDR only: fast rebinding
+        // through TIME_WAIT, never sharing a live listener.
         const value: c_int = 1;
         os_net.setsockopt(handle, os_net.SOL.SOCKET, os_net.SO.REUSEADDR, std.mem.asBytes(&value)) catch
             return error.OptionUnsupported;
-        if (@hasDecl(os_net.SO, "REUSEPORT")) {
-            os_net.setsockopt(handle, os_net.SOL.SOCKET, os_net.SO.REUSEPORT, std.mem.asBytes(&value)) catch {};
-        }
     }
 
     var bind_addr = zio_addr;
@@ -2665,6 +2670,34 @@ test "io: net TCP listen/connect/accept handshake" {
 
             const client = try connect_result;
             defer client.close(io);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: reuse_address never shares a live TCP listener" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(
+                &.{ .ip4 = .loopback(0) },
+                io,
+                .{ .reuse_address = true },
+            );
+            defer server.deinit(io);
+
+            // With SO_REUSEPORT this second listen would silently succeed and
+            // steal a share of incoming connections; `reuse_address` must
+            // mean TIME_WAIT rebinding only.
+            try std.testing.expectError(error.AddressInUse, Io.net.IpAddress.listen(
+                &server.socket.address,
+                io,
+                .{ .reuse_address = true },
+            ));
         }
     };
 
