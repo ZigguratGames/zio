@@ -2,6 +2,9 @@ src/io.zig
   s_727997faf8b15e::t_a56a314a68c88e 2874-2894
   s_727997faf8b15e::t_4d84642826510b 2871-2873
   s_727997faf8b15e::t_59bae1464ea0a4 2895-2897
+  s_727997faf8b15e::t_ddac425248ecff 1936-1938
+src/net.zig
+  s_727997faf8b15e::t_ba46c351dcc739 909-916
 ---
 {
   "schema_version": "authorship/3.0.0",
