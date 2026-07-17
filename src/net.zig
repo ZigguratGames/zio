@@ -906,14 +906,16 @@ pub const Socket = struct {
         try self.setBoolOption(os.posix.SOL.SOCKET, os.posix.SO.REUSEPORT, enabled);
     }
 
-    /// Set SO_REUSEADDR, plus SO_REUSEPORT where supported. Callers that ask for
-    /// address reuse want both: REUSEADDR alone still fails to rebind while a
-    /// prior process's socket lingers (e.g. right after a crash/restart), which
-    /// REUSEPORT allows. Keeps the native bind/listen paths consistent with the
-    /// std.Io listen path, which already sets both.
+    /// Set SO_REUSEADDR only — deliberate divergence from upstream, which
+    /// also sets SO_REUSEPORT here (and std.Io documents `reuse_address` as
+    /// both on POSIX). REUSEPORT lets an unrelated process silently bind an
+    /// already-served TCP port, after which the kernel splits accepted
+    /// connections between the listeners — a debugging disaster that no
+    /// server intends by "reuse address". Here address reuse means fast
+    /// rebinding through TIME_WAIT only, never sharing a live listener.
+    /// Every bind/listen path (native and std.Io) funnels through this.
     pub fn setReuse(self: Socket, enabled: bool) !void {
         try self.setReuseAddress(enabled);
-        self.setReusePort(enabled) catch {}; // best-effort; unsupported on Windows
     }
 
     /// Enable or disable TCP keepalive (SO_KEEPALIVE)

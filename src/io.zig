@@ -1933,6 +1933,9 @@ fn netListenIpImpl(_: ?*anyopaque, address: *const Io.net.IpAddress, options: Io
     var socket = zio_net.Socket.open(.fromStd(options.mode), .fromPosix(zio_addr.any.family), .fromStd(options.protocol)) catch |err| return openErrToListenErr(err);
     errdefer socket.close();
 
+    // Deliberate divergence from upstream std.Io semantics (see
+    // Socket.setReuse): `reuse_address` means SO_REUSEADDR only, never
+    // SO_REUSEPORT.
     if (options.reuse_address) socket.setReuse(true) catch return error.OptionUnsupported;
 
     socket.bind(.{ .ip = zio_addr }) catch |err| return bindErrToListenErr(err);
@@ -2860,6 +2863,34 @@ test "io: net TCP listen/connect/accept handshake" {
             future.await(io);
             const client = try connect_result;
             defer client.close(io);
+        }
+    };
+
+    var handle = try rt.spawn(Worker.run, .{rt.io()});
+    try handle.join();
+}
+
+test "io: reuse_address never shares a live TCP listener" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    const Worker = struct {
+        fn run(io: Io) !void {
+            var server = try Io.net.IpAddress.listen(
+                &.{ .ip4 = .loopback(0) },
+                io,
+                .{ .reuse_address = true },
+            );
+            defer server.deinit(io);
+
+            // With SO_REUSEPORT this second listen would silently succeed and
+            // steal a share of incoming connections; `reuse_address` must
+            // mean TIME_WAIT rebinding only.
+            try std.testing.expectError(error.AddressInUse, Io.net.IpAddress.listen(
+                &server.socket.address,
+                io,
+                .{ .reuse_address = true },
+            ));
         }
     };
 
