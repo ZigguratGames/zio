@@ -1,0 +1,37 @@
+src/common.zig
+  s_d239fb0fbee1a6::t_74c80b162a9360 175-180
+  s_d239fb0fbee1a6::t_01d9779ac11f3b 181
+src/autocancel.zig
+  s_d239fb0fbee1a6::t_16c9d2f0965fec 50-53
+src/time.zig
+  s_d239fb0fbee1a6::t_d300b9c4767fac 563-566
+src/runtime.zig
+  s_d239fb0fbee1a6::t_b2a901cbb20046 1926,1953,1968,2011
+  s_d239fb0fbee1a6::t_f37ec85a623fdc 1952,1956,1958,2012-2015,2022,2025-2028
+  s_d239fb0fbee1a6::t_2aeb7fdc51902c 1976-1979
+  s_d239fb0fbee1a6::t_8924e2c5a2a8c4 2030
+  s_d239fb0fbee1a6::t_11066e82dc1543 1967,1971,2007,2016
+  s_d239fb0fbee1a6::t_f139ffca43646d 1924-1925,1931-1933,1945-1949,1951,2017-2018,2029,2031-2032
+  s_d239fb0fbee1a6::t_38e77216175a72 1927-1929,1934,1937,1950,1954-1955,1959-1960,1970,1972-1974,1981,2019-2021,2023
+  s_d239fb0fbee1a6::t_c41c0e5b35c3a0 2000-2002
+  s_d239fb0fbee1a6::t_ca527fd69dd16b 1980
+  s_d239fb0fbee1a6::t_0a632369cdf31a 1961-1966,1986,1994-1995,2006
+  s_d239fb0fbee1a6::t_fc8f85d2e07b8c 1930,1938-1944,1957,1975,1982-1985,1987-1993,1996-1999,2009,2024
+  s_d239fb0fbee1a6::t_9fee856d7cf560 1935-1936,1969,2003-2005,2008,2010
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "98ee64b89840ce1737cba0bf4b062d6196f4bd1f",
+  "prompts": {},
+  "sessions": {
+    "s_d239fb0fbee1a6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07a94ea9cffeCscH8cLPPoSSOL",
+        "model": "moonshotai/kimi-k3"
+      },
+      "human_author": "Shroom <68300730+ezShroom@users.noreply.github.com>"
+    }
+  }
+}
