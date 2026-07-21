@@ -560,6 +560,10 @@ pub const Timeout = union(enum) {
         ctx.waiter = waiter;
         ctx.timer.c.userdata = ctx;
         ctx.timer.c.callback = timerCallback;
+        // timerCallback only signals the waiter: finish synchronously so the
+        // completion never sits in the deferred queue while this WaitContext
+        // (and its ctx.timer) can be re-initialized by a later asyncWait.
+        ctx.timer.c.flags = .{ .defer_callback = false };
 
         const executor = getCurrentExecutor();
         executor.loop.add(&ctx.timer.c);

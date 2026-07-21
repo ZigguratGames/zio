@@ -172,6 +172,13 @@ pub const Waiter = struct {
         var timer: ev.Timer = .initClock(timeout, clock);
         timer.c.userdata = self;
         timer.c.callback = callback;
+        // The callback only wakes this waiter, so finish synchronously from
+        // checkTimers. Deferring lets the completion outlive the wait: a
+        // timer fired in the post-poll checkTimers is drained next tick, and
+        // in between the waiter can be canceled and its coroutine stack
+        // reused — the drain would then finish a completion whose struct
+        // already describes a new, live timer.
+        timer.c.flags = .{ .defer_callback = false };
 
         task.getExecutor().loop.setTimer(&timer, timeout);
         defer timer.c.loop.?.clearTimer(&timer);

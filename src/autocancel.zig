@@ -47,6 +47,10 @@ pub const AutoCancel = struct {
         // Initialize ev.Timer
         self.timer.c.userdata = self;
         self.timer.c.callback = autoCancelCallback;
+        // The callback only marks the task canceled and wakes it: finish
+        // synchronously so a fired completion never outlives this
+        // stack-allocated AutoCancel via the deferred queue.
+        self.timer.c.flags = .{ .defer_callback = false };
 
         // Activate the timer
         executor.loop.setTimer(&self.timer, timeout);

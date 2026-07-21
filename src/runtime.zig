@@ -1921,3 +1921,112 @@ test "runtime: disable main executor" {
     const result = handle.join();
     try std.testing.expectEqual(42, result);
 }
+
+test "runtime: cancel-spamming timed sleeps cannot corrupt the loop via stack reuse" {
+    // Regression test for the deferred timer-finish race. A Waiter timer that
+    // fires in the post-poll checkTimers is drained on the *next* tick; in
+    // between, the waiting task can be canceled and its coroutine stack
+    // reused by a new timed wait — re-initializing the still-queued
+    // completion, which the drain then finished against the new, live timer
+    // (assertion failure in safe builds; heap/accounting corruption in fast
+    // ones). Reproduced in seconds against a real server by canceling a
+    // 100ms timeout child on every datagram (the worldgen demo's Bedrock
+    // loop). With the synchronous finish for waiter-waking timers the
+    // completion is dead before the canceled task unwinds, so no drain can
+    // ever see it.
+    //
+    // The window needs one kevent return to hold an I/O readiness event and
+    // the boot/real wall-timer event together: the I/O completion
+    // (synchronous finish) readies a task in the same tick the fire defers
+    // from, and that task cancels + respawns before the next tick's drain.
+    // kevent collects both only when the datagram arrives in the same
+    // instant the wall event fires — so the sender thread bursts datagrams
+    // precisely around each round's deadline.
+    const runtime = try Runtime.init(std.testing.allocator, .{
+        .executors = .exact(1),
+    });
+    defer runtime.deinit();
+
+    const net = @import("net.zig");
+    const H = struct {
+        const rounds = 100;
+
+        const Ctx = struct {
+            rx: net.Socket,
+            stop: std.atomic.Value(bool) = .init(false),
+            round_start: std.atomic.Value(u64) = .init(0),
+            sender_thread: ?std.Thread = null,
+        };
+
+        fn nowMono() u64 {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
+        }
+
+        fn sleeper() void {
+            var waiter: Waiter = .init();
+            // Boot clock: natively armed on Darwin, so the fire defers from
+            // the post-poll checkTimers when the wall event surfaces in a
+            // poll — including a poll that also carries a datagram.
+            waiter.timedWaitClock(1, .fromMilliseconds(2), .boot, .allow_cancel) catch return;
+        }
+
+        fn senderMain(port: u16, ctx: *Ctx) void {
+            const rc = std.c.socket(std.c.AF.INET, std.c.SOCK.DGRAM, 0);
+            if (rc < 0) return;
+            const sock = rc;
+            defer _ = std.c.close(sock);
+            const dest = net.IpAddress.parseIp4("127.0.0.1", port) catch return;
+            const data = [_]u8{42};
+            var last_round: u64 = 0;
+            while (!ctx.stop.load(.monotonic)) {
+                const start = ctx.round_start.load(.monotonic);
+                if (start == last_round) {
+                    std.Thread.yield() catch return;
+                    continue;
+                }
+                last_round = start;
+                // Burst around the deadline (start + 2ms): several datagrams
+                // in the same instant the wall event fires, so one kevent
+                // return collects both (see the test comment).
+                const fire_at = start + 2 * std.time.ns_per_ms;
+                while (nowMono() < fire_at) {
+                    std.Thread.yield() catch return;
+                }
+                for (0..20) |_| {
+                    _ = std.c.sendto(sock, &data, data.len, 0, @ptrCast(&dest.any), @sizeOf(@TypeOf(dest.in)));
+                }
+            }
+        }
+
+        fn driver(rt: *Runtime, ctx: *Ctx) !void {
+            var buf: [64]u8 = undefined;
+            for (0..rounds) |_| {
+                ctx.round_start.store(nowMono(), .monotonic);
+                var child = try rt.spawn(sleeper, .{});
+                const deadline = Timestamp.now(.monotonic).addDuration(.fromMilliseconds(2));
+                while (Timestamp.now(.monotonic).value < deadline.value) {
+                    _ = try ctx.rx.receiveFrom(&buf, .none);
+                }
+                // Cancel now — inside the fire/cancel window if we hit it —
+                // and immediately respawn: the freed coroutine stack is
+                // reused by the next spawn before the next tick's drain,
+                // re-initializing the still-queued completion (old code).
+                child.cancel();
+            }
+        }
+    };
+
+    const loopback0 = try net.IpAddress.parseIp4("127.0.0.1", 0);
+    var ctx: H.Ctx = .{ .rx = try loopback0.bind(.{ .reuse_address = true }) };
+    defer ctx.rx.close();
+    ctx.sender_thread = try std.Thread.spawn(.{}, H.senderMain, .{ ctx.rx.address.ip.getPort(), &ctx });
+    defer {
+        ctx.stop.store(true, .monotonic);
+        ctx.sender_thread.?.join();
+    }
+
+    var main = try runtime.spawn(H.driver, .{ runtime, &ctx });
+    try main.join();
+}

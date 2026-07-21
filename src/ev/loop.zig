@@ -346,18 +346,6 @@ pub const LoopState = struct {
 
     pub fn markCompleted(self: *LoopState, completion: *Completion) void {
         if (completion.state != .running or !completion.has_result) {
-            std.debug.print(
-                "zio-diag: op={s} state={s} has_result={} flags={} userdata={?*} callback={?*} owner_callback={?*}\n",
-                .{
-                    @tagName(completion.op),
-                    @tagName(completion.state),
-                    completion.has_result,
-                    completion.flags,
-                    completion.userdata,
-                    completion.callback,
-                    completion.group.owner_callback,
-                },
-            );
             std.debug.panic(
                 "zio: markCompleted invariant violated: op={s} state={s} has_result={} (double completion or missing result)",
                 .{ @tagName(completion.op), @tagName(completion.state), completion.has_result },
@@ -394,28 +382,6 @@ pub const LoopState = struct {
 
     pub fn finishCompletion(self: *LoopState, completion: *Completion) void {
         if (completion.state != .completed) {
-            // TEMP DIAGNOSTIC: dump the completion's identity so the culprit
-            // timer/op can be named without a debugger.
-            std.debug.print(
-                "zio-diag: op={s} state={s} has_result={} flags={} userdata={?*} callback={?*} owner_callback={?*}",
-                .{
-                    @tagName(completion.op),
-                    @tagName(completion.state),
-                    completion.has_result,
-                    completion.flags,
-                    completion.userdata,
-                    completion.callback,
-                    completion.group.owner_callback,
-                },
-            );
-            if (completion.op == .timer) {
-                const timer: *Timer = @alignCast(@fieldParentPtr("c", completion));
-                std.debug.print(
-                    " timer: clock={s} deadline={} timeout_tag={s} heap_node={*}",
-                    .{ @tagName(timer.clock), timer.deadline.value, @tagName(timer.timeout), &timer.heap },
-                );
-            }
-            std.debug.print("\n", .{});
             std.debug.panic(
                 "zio: finishCompletion invariant violated: op={s} state={s} (double dispatch)",
                 .{ @tagName(completion.op), @tagName(completion.state) },
