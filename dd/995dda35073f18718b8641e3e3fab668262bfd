@@ -1,0 +1,33 @@
+src/ev/queue.zig
+  s_d239fb0fbee1a6::t_3bcbe4a188fc6b 44-49
+src/ev/sockreg.zig
+  s_d239fb0fbee1a6::t_a5b90485865b57 200
+  s_d239fb0fbee1a6::t_1b3de0d057626d 184
+src/ev/loop.zig
+  s_d239fb0fbee1a6::t_eabd3d4ecd3b8a 384-389
+  s_d239fb0fbee1a6::t_a374471ef68880 348-353
+src/ev/completion.zig
+  s_d239fb0fbee1a6::t_f6c103e058afae 374-379
+  s_d239fb0fbee1a6::t_dbf501b368f07e 393-398,404-409
+src/ev/backends/kqueue.zig
+  s_d239fb0fbee1a6::t_3417843c1e1b07 315
+  s_d239fb0fbee1a6::t_d1c0e15d7f9132 467
+  s_d239fb0fbee1a6::t_96beb3f7faa3f1 295
+  s_d239fb0fbee1a6::t_e302f55ccb1cf6 539,541
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "dd995dda35073f18718b8641e3e3fab668262bfd",
+  "prompts": {},
+  "sessions": {
+    "s_d239fb0fbee1a6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07a94ea9cffeCscH8cLPPoSSOL",
+        "model": "moonshotai/kimi-k3"
+      },
+      "human_author": "Shroom <68300730+ezShroom@users.noreply.github.com>"
+    }
+  }
+}
