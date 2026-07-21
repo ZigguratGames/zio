@@ -181,7 +181,7 @@ pub fn dirForOp(c: *Completion) Dir {
             .recv => .read,
             .send => .write,
         },
-        else => unreachable,
+        else => std.debug.panic("zio sockreg: dirForOp on non-socket op {s}", .{@tagName(c.op)}),
     };
 }
 
@@ -197,7 +197,7 @@ pub fn netHandle(c: *Completion) net.fd_t {
         .net_recvmsg => c.cast(NetRecvMsg).handle,
         .net_sendmsg => c.cast(NetSendMsg).handle,
         .net_poll => c.cast(NetPoll).handle,
-        else => unreachable,
+        else => std.debug.panic("zio sockreg: netHandle on non-socket op {s}", .{@tagName(c.op)}),
     };
 }
 

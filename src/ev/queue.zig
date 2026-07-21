@@ -41,8 +41,12 @@ pub fn Queue(comptime T: type) type {
 
         /// Enqueue a new element to the back of the queue.
         pub fn push(self: *Self, v: *T) void {
-            assert(v.next == null);
-            assert(v.prev == null);
+            if (v.next != null or v.prev != null) {
+                std.debug.panic(
+                    "zio: Queue.push on already-linked node: {*} next={?*} prev={?*} (double-link or missing unlink)",
+                    .{ v, v.next, v.prev },
+                );
+            }
 
             if (self.tail) |tail| {
                 // If we have elements in the queue, then we add a new tail.

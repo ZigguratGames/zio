@@ -371,7 +371,12 @@ pub const Completion = struct {
     }
 
     pub fn cast(c: *Completion, comptime T: type) *T {
-        std.debug.assert(c.op == Op.fromType(T));
+        if (c.op != Op.fromType(T)) {
+            std.debug.panic(
+                "zio: Completion.cast type mismatch: op={s} wanted={s} (corrupted or misrouted completion)",
+                .{ @tagName(c.op), @tagName(Op.fromType(T)) },
+            );
+        }
         return @alignCast(@fieldParentPtr("c", c));
     }
 
@@ -385,14 +390,23 @@ pub const Completion = struct {
     }
 
     pub fn setError(c: *Completion, err: anyerror) void {
-        std.debug.assert(!c.has_result);
+        if (c.has_result) {
+            std.debug.panic(
+                "zio: setError on completion that already has a result: op={s} state={s} err={?s} (result set twice)",
+                .{ @tagName(c.op), @tagName(c.state), if (c.err) |e| @errorName(e) else null },
+            );
+        }
         c.err = err;
         c.has_result = true;
     }
 
     pub fn setResult(c: *Completion, comptime op: Op, result: @FieldType(op.toType(), "result_private_do_not_touch")) void {
-        std.debug.assert(!c.has_result);
-        std.debug.assert(c.op == op);
+        if (c.has_result or c.op != op) {
+            std.debug.panic(
+                "zio: setResult invariant violated: op={s} wanted={s} state={s} has_result={}",
+                .{ @tagName(c.op), @tagName(op), @tagName(c.state), c.has_result },
+            );
+        }
         const T = op.toType();
         c.cast(T).result_private_do_not_touch = result;
         c.has_result = true;

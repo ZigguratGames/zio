@@ -345,8 +345,12 @@ pub const LoopState = struct {
     }
 
     pub fn markCompleted(self: *LoopState, completion: *Completion) void {
-        std.debug.assert(completion.state == .running);
-        std.debug.assert(completion.has_result);
+        if (completion.state != .running or !completion.has_result) {
+            std.debug.panic(
+                "zio: markCompleted invariant violated: op={s} state={s} has_result={} (double completion or missing result)",
+                .{ @tagName(completion.op), @tagName(completion.state), completion.has_result },
+            );
+        }
 
         // Atomically set completed flag
         var old = completion.cancel_state.load(.acquire);
@@ -377,7 +381,12 @@ pub const LoopState = struct {
     }
 
     pub fn finishCompletion(self: *LoopState, completion: *Completion) void {
-        std.debug.assert(completion.state == .completed);
+        if (completion.state != .completed) {
+            std.debug.panic(
+                "zio: finishCompletion invariant violated: op={s} state={s} (double dispatch)",
+                .{ @tagName(completion.op), @tagName(completion.state) },
+            );
+        }
 
         completion.state = .dead;
         self.decrActive();

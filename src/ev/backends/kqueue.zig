@@ -292,7 +292,7 @@ fn getFilter(completion: *Completion) i16 {
         },
         .process_wait => std.c.EVFILT.PROC,
         .mach_port => if (builtin.os.tag.isDarwin()) std.c.EVFILT.MACHPORT else unreachable,
-        else => unreachable,
+        else => std.debug.panic("zio kqueue: no filter for op {s} (misrouted completion)", .{@tagName(completion.op)}),
     };
 }
 
@@ -312,7 +312,7 @@ fn getIdent(completion: *Completion) usize {
         .pipe_close => @intCast(completion.cast(PipeClose).handle),
         .process_wait => @intCast(completion.cast(ProcessWait).handle),
         .mach_port => completion.cast(MachPort).port,
-        else => unreachable,
+        else => std.debug.panic("zio kqueue: no ident for op {s} (misrouted completion)", .{@tagName(completion.op)}),
     };
 }
 
@@ -464,7 +464,7 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
     state.incrActive();
 
     switch (c.op) {
-        .group, .timer, .async, .work => unreachable, // Managed by the loop
+        .group, .timer, .async, .work => std.debug.panic("zio kqueue: loop-managed op {s} reached backend submit", .{@tagName(c.op)}),
 
         // Synchronous operations - complete immediately
         .net_open => {
@@ -536,9 +536,9 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
         },
 
         // File operations are handled by Loop via thread pool
-        .file_open, .file_create, .file_close, .file_read, .file_write, .file_sync, .file_size, .file_set_size, .file_set_permissions, .file_set_owner, .file_set_timestamps, .file_stat, .dir_open, .dir_close, .dir_read, .dir_create_dir, .dir_rename, .dir_rename_preserve, .dir_delete_file, .dir_delete_dir, .dir_set_permissions, .dir_set_owner, .dir_set_file_permissions, .dir_set_file_owner, .dir_set_file_timestamps, .dir_sym_link, .dir_read_link, .dir_hard_link, .dir_access, .dir_real_path, .dir_real_path_file, .file_real_path, .file_hard_link, .device_io_control => unreachable,
+        .file_open, .file_create, .file_close, .file_read, .file_write, .file_sync, .file_size, .file_set_size, .file_set_permissions, .file_set_owner, .file_set_timestamps, .file_stat, .dir_open, .dir_close, .dir_read, .dir_create_dir, .dir_rename, .dir_rename_preserve, .dir_delete_file, .dir_delete_dir, .dir_set_permissions, .dir_set_owner, .dir_set_file_permissions, .dir_set_file_owner, .dir_set_file_timestamps, .dir_sym_link, .dir_read_link, .dir_hard_link, .dir_access, .dir_real_path, .dir_real_path_file, .file_real_path, .file_hard_link, .device_io_control => std.debug.panic("zio kqueue: file op {s} reached backend submit (should be thread-pooled)", .{@tagName(c.op)}),
         // Driven by Loop's generic read/write fallback, never reaches the backend.
-        .net_send_file => unreachable,
+        .net_send_file => std.debug.panic("zio kqueue: net_send_file reached backend submit (should use the loop fallback)", .{}),
     }
 }
 
