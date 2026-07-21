@@ -1,0 +1,20 @@
+src/ev/loop.zig
+  s_d239fb0fbee1a6::t_794a278971d363 349-360
+  s_d239fb0fbee1a6::t_90c01c4a7a927c 397-418
+---
+{
+  "schema_version": "authorship/3.0.0",
+  "git_ai_version": "1.6.15",
+  "base_commit_sha": "78b7f4005f1e7498ea1f0d3fc6a7360580c63ad0",
+  "prompts": {},
+  "sessions": {
+    "s_d239fb0fbee1a6": {
+      "agent_id": {
+        "tool": "opencode",
+        "id": "ses_07a94ea9cffeCscH8cLPPoSSOL",
+        "model": "moonshotai/kimi-k3"
+      },
+      "human_author": "Shroom <68300730+ezShroom@users.noreply.github.com>"
+    }
+  }
+}
