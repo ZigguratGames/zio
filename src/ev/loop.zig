@@ -1,7 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const Backend = @import("backend.zig").Backend;
-const BackendCapabilities = @import("completion.zig").BackendCapabilities;
 const Completion = @import("completion.zig").Completion;
 const Group = @import("completion.zig").Group;
 const Timer = @import("completion.zig").Timer;
@@ -27,7 +26,13 @@ const common = @import("backends/common.zig");
 
 const log = @import("../common.zig").log;
 
-const in_safe_mode = builtin.mode == .Debug or builtin.mode == .ReleaseSafe;
+const in_safe_mode = builtin.mode == .debug or builtin.mode == .safe;
+const in_debug_mode = builtin.mode == .debug;
+
+/// The loop bound to the current thread (debug builds only), used by
+/// `assertOwnThread`. Set by `Loop.init`, cleared by `Loop.deinit`.
+threadlocal var current_loop: if (in_debug_mode) ?*Loop else void =
+    if (in_debug_mode) null else {};
 
 /// How the NetSendFile fallback lays out its scratch from the (up to two)
 /// caller-provided buffers.
@@ -131,12 +136,6 @@ pub const LoopGroup = struct {
     shared: Backend.SharedState = .{},
 };
 
-pub const RunMode = enum {
-    no_wait,
-    once,
-    until_done,
-};
-
 fn timerDeadlineLess(_: void, a: *Timer, b: *Timer) bool {
     return a.deadline.value < b.deadline.value;
 }
@@ -160,13 +159,13 @@ fn clockIndex(clock: Clock) usize {
     // and are driven by the uncapped awake poll timeout instead of a separate
     // capped/native path.
     const c: Clock = if (clock == .boot and !time.boot_distinct_from_awake) .awake else clock;
-    const idx = @intFromEnum(c);
+    const idx = @backingInt(c);
     if (idx >= wall_clock_count) @panic("timers cannot use CPU-time clocks");
     return idx;
 }
 
 fn indexClock(index: usize) Clock {
-    return @enumFromInt(index);
+    return @fromBackingInt(@intCast(index));
 }
 
 pub fn SimpleStack(comptime T: type) type {
@@ -225,16 +224,17 @@ pub const LoopState = struct {
     running: bool = false,
     stopped: bool = false,
 
-    active: usize = 0,
-    /// I/O operations submitted to backend awaiting completion
-    // Plain counter mutated only by the owner thread, but read cross-thread
-    // by the scheduler's load shedding, hence the atomic accessors below.
-    inflight_io: usize = 0,
+    /// Not-yet-finished completions owned by this loop. The count lives on the
+    /// completion's owning loop (`completion.loop`): incremented at the submit
+    /// sites, decremented in `finishCompletion` routed through
+    /// `completion.loop`, which may run on a different loop's thread (epoll
+    /// single-owner servicing, the shared IOCP port) - hence the atomic.
+    active: std.atomic.Value(usize) = .init(0),
 
     wake_requested: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Cached "now" per wall clock, indexed by `clockIndex`. `awake` is
-    /// refreshed eagerly once per scan (`updateNow`); `boot`/`real` are
+    /// refreshed eagerly at the start of each scan (`updateNow`); `boot`/`real` are
     /// refreshed lazily on first use within a scan and cached for the rest of
     /// it. `tick` is a monotonically increasing scan counter; `now_tick[i]`
     /// records the scan that `now[i]` was last filled, so a mismatch refreshes.
@@ -274,98 +274,48 @@ pub const LoopState = struct {
     async_handles: Queue(Completion) = .{},
 
     completions: Queue(Completion) = .{},
+    /// Finished standalone completions awaiting user-callback dispatch, when the
+    /// loop was created with `do_not_call_callbacks`. Drained by
+    /// `Loop.nextDispatched`.
+    dispatched: Queue(Completion) = .{},
     work_completions: AtomicStack(Completion) = .{},
 
     pub const wake_loop: u32 = 1;
     pub const wake_async: u32 = 2;
     pub const wake_cancel: u32 = 4;
 
-    /// Increment the inflight I/O counter. On multi-threaded backends
-    /// (IOCP) this routes to a shared atomic; on single-threaded backends
-    /// only the owner thread mutates, but other executors read the count for
-    /// load shedding, so the access is a monotonic atomic either way.
-    pub fn incrInflight(self: *LoopState) void {
-        if (comptime Backend.capabilities.is_multi_threaded) {
-            _ = self.loop.loop_group.shared.inflight_io.fetchAdd(1, .monotonic);
-        } else {
-            @atomicStore(usize, &self.inflight_io, self.inflight_io + 1, .monotonic);
-        }
-    }
-
-    /// Decrement the inflight I/O counter.
-    pub fn decrInflight(self: *LoopState) void {
-        if (comptime Backend.capabilities.is_multi_threaded) {
-            _ = self.loop.loop_group.shared.inflight_io.fetchSub(1, .monotonic);
-        } else {
-            @atomicStore(usize, &self.inflight_io, self.inflight_io - 1, .monotonic);
-        }
-    }
-
-    /// Read the inflight I/O counter (any thread).
-    pub fn loadInflight(self: *const LoopState) usize {
-        if (comptime Backend.capabilities.is_multi_threaded) {
-            return @intCast(self.loop.loop_group.shared.inflight_io.load(.monotonic));
-        } else {
-            return @atomicLoad(usize, &self.inflight_io, .monotonic);
-        }
-    }
-
-    /// Increment the active (not-yet-finished) completion counter.
+    /// Increment this loop's active completion counter. Counted by the loop at
+    /// every submit site (backends do no accounting).
     pub fn incrActive(self: *LoopState) void {
-        if (comptime Backend.capabilities.is_multi_threaded) {
-            _ = self.loop.loop_group.shared.active.fetchAdd(1, .monotonic);
-        } else {
-            self.active += 1;
-        }
+        _ = self.active.fetchAdd(1, .monotonic);
     }
 
-    /// Decrement the active (not-yet-finished) completion counter.
+    /// Decrement this loop's active completion counter. Callers must invoke
+    /// this on the completion's owning loop (`completion.loop`), not on
+    /// whichever loop happens to run the finish (see `finishCompletion`).
     pub fn decrActive(self: *LoopState) void {
-        if (comptime Backend.capabilities.is_multi_threaded) {
-            _ = self.loop.loop_group.shared.active.fetchSub(1, .monotonic);
-        } else {
-            self.active -= 1;
-        }
+        _ = self.active.fetchSub(1, .monotonic);
     }
 
-    /// Read the active completion counter.
+    /// Read this loop's active completion counter (any thread).
     pub fn loadActive(self: *const LoopState) usize {
-        if (comptime Backend.capabilities.is_multi_threaded) {
-            return @intCast(self.loop.loop_group.shared.active.load(.monotonic));
-        } else {
-            return self.active;
-        }
+        return self.active.load(.monotonic);
     }
 
-    /// Called by backends when an I/O operation completes.
-    /// Decrements inflight_io counter and marks the completion done.
+    /// Called by backends when an operation they accepted completes. Tells the
+    /// backend to drop its inflight count (the backend of the loop running the
+    /// completion, whose storage covers the op on every backend) and marks the
+    /// completion done.
     pub fn markCompletedFromBackend(self: *LoopState, completion: *Completion) void {
-        self.decrInflight();
+        self.loop.backend.decrInflight();
         self.markCompleted(completion);
     }
 
     pub fn markCompleted(self: *LoopState, completion: *Completion) void {
-        if (completion.state != .running or !completion.has_result) {
-            std.debug.panic(
-                "zio: markCompleted invariant violated: op={s} state={s} has_result={} (double completion or missing result)",
-                .{ @tagName(completion.op), @tagName(completion.state), completion.has_result },
-            );
-        }
-
-        // Atomically set completed flag
-        var old = completion.cancel_state.load(.acquire);
-        while (true) {
-            var new = old;
-            new.completed = true;
-            old = completion.cancel_state.cmpxchgWeak(old, new, .acq_rel, .acquire) orelse break;
-        }
-
-        // Always set state
-        completion.state = .completed;
-
-        // Only call finish if not in cancel queue
-        // If in_queue, cancel queue processing will call finishCompletion
-        if (!old.in_queue) {
+        std.debug.assert(completion.has_result);
+        const old = completion.enterCompleted();
+        // With a cancel pass in flight, that pass owns the dispatch.
+        if (!old.cancel_inflight) {
             self.dispatchCompletion(completion);
         }
     }
@@ -381,15 +331,11 @@ pub const LoopState = struct {
     }
 
     pub fn finishCompletion(self: *LoopState, completion: *Completion) void {
-        if (completion.state != .completed) {
-            std.debug.panic(
-                "zio: finishCompletion invariant violated: op={s} state={s} (double dispatch)",
-                .{ @tagName(completion.op), @tagName(completion.state) },
-            );
-        }
-
-        completion.state = .dead;
-        self.decrActive();
+        completion.enterDead();
+        // Route the decrement to the loop that owns the completion: `self` here
+        // can be a different loop (epoll single-owner servicing, the shared
+        // IOCP port, a group finished by the loop that ran its last member).
+        completion.getLoop().?.state.decrActive();
 
         // Both callbacks below can free `completion`, so whichever may free it must
         // run LAST, with nothing touching `completion` afterward. Cache the owner
@@ -398,6 +344,20 @@ pub const LoopState = struct {
         // (Rearm handles are exempt from the freeing contract by definition.)
         const owner_callback = completion.group.owner_callback;
         const was_rearm = completion.flags.rearm;
+
+        // Deferred dispatch: a standalone (non-rearm, no owner) completion is
+        // queued for the driver to call itself via `nextDispatched`, rather than
+        // invoked here. `completion` was just popped from `completions`, so its
+        // queue link is free to reuse. Rearm/group completions fall through and
+        // run inline, since their machinery must stay synchronous.
+        //
+        // A null callback opts a single completion into the same delivery:
+        // it is handed out through `nextDispatched` instead of being invoked.
+        // Task wakes travel this way (see Executor.drainDispatched).
+        if ((self.loop.do_not_call_callbacks or completion.callback == null) and !was_rearm and owner_callback == null) {
+            self.dispatched.push(completion);
+            return;
+        }
 
         // The completion's own callback runs first: for a group member it reports
         // the member's own result while the member is still alive; for a standalone
@@ -420,13 +380,10 @@ pub const LoopState = struct {
         }
     }
 
-    pub fn markRunning(self: *LoopState, completion: *Completion) void {
-        _ = self;
-        completion.state = .running;
-    }
-
     /// Advance the scan counter and refresh the awake snapshot. Bumping `tick`
     /// invalidates the lazily-cached boot/real values for the new scan.
+    /// Owner-thread only, so no timer lock: the cross-thread `clearTimer`
+    /// never reads `now`/`tick`.
     pub fn updateNow(self: *LoopState) void {
         self.tick +%= 1;
         self.now[0] = time.now(.monotonic);
@@ -455,31 +412,20 @@ pub const LoopState = struct {
         self.timer_mutex.unlock();
     }
 
-    pub fn setTimer(self: *LoopState, timer: *Timer) void {
-        const idx = clockIndex(timer.clock);
-        // `.running` means the timer is already in its heap (resetting it);
-        // anything else means it's newly activated. Don't key this off
-        // `deadline.value`, which can legitimately be 0 for an absolute
-        // deadline at/at-before the epoch and would then leak/double-fire.
-        if (timer.c.state == .running) {
-            self.timers[idx].remove(timer);
-        } else {
-            self.incrActive();
-        }
+    /// Compute the deadline from `timer.timeout` and insert into the heap.
+    /// The timer must not be in a heap.
+    pub fn armTimer(self: *LoopState, timer: *Timer) void {
         switch (timer.timeout) {
             .none => timer.deadline = .{ .value = std.math.maxInt(time.TimeInt) },
             .duration => |d| timer.deadline = self.nowFor(timer.clock).addDuration(d),
             .deadline => |ts| timer.deadline = ts,
         }
-        timer.c.state = .running;
-        self.timers[idx].insert(timer);
+        self.timers[clockIndex(timer.clock)].insert(timer);
     }
 
-    pub fn clearTimer(self: *LoopState, timer: *Timer) void {
-        const was_active = timer.c.state == .running;
-        if (was_active) {
-            self.timers[clockIndex(timer.clock)].remove(timer);
-        }
+    /// Remove from the heap. The timer must be in it (armed and not mid-fire).
+    pub fn disarmTimer(self: *LoopState, timer: *Timer) void {
+        self.timers[clockIndex(timer.clock)].remove(timer);
         timer.deadline = .zero;
     }
 
@@ -526,6 +472,12 @@ pub const LoopState = struct {
                 slot.* = node.resend_next;
                 node.resend_next = null;
                 node.resend_key = null;
+                // Fire the release hook (drops the blocking task's keep-alive
+                // ref) now that the entry is unlinked. Cleared so it runs once.
+                if (node.resend_release) |release| {
+                    node.resend_release = null;
+                    release(node);
+                }
             }
         }
     }
@@ -554,6 +506,14 @@ pub const Loop = struct {
 
     in_add: if (in_safe_mode) bool else void = if (in_safe_mode) false else {},
 
+    /// When true, `tick` does not dispatch finished standalone completions to
+    /// their callbacks; it queues them instead, and the driver drains them with
+    /// `nextDispatched`, invoking the callbacks itself. This lets an embedder
+    /// (e.g. a CPython asyncio event loop) run the blocking poll with the GIL
+    /// released and then invoke callbacks with the GIL held. Rearm handles and
+    /// group-owner callbacks are unaffected (they still run inline).
+    do_not_call_callbacks: bool = false,
+
     const default_queue_size = 256;
 
     pub const Options = struct {
@@ -561,6 +521,7 @@ pub const Loop = struct {
         thread_pool: ?*ThreadPool = null,
         loop_group: ?*LoopGroup = null,
         queue_size: u16 = default_queue_size,
+        do_not_call_callbacks: bool = false,
     };
 
     pub fn init(self: *Loop, options: Options) !void {
@@ -570,6 +531,7 @@ pub const Loop = struct {
             .allocator = options.allocator,
             .thread_pool = options.thread_pool,
             .loop_group = undefined,
+            .do_not_call_callbacks = options.do_not_call_callbacks,
         };
 
         if (options.loop_group) |group| {
@@ -593,20 +555,44 @@ pub const Loop = struct {
         errdefer self.backend.deinit();
 
         self.state.initialized = true;
+
+        if (in_debug_mode) current_loop = self;
     }
 
     pub fn deinit(self: *Loop) void {
+        self.assertOwnThread();
+        if (in_debug_mode) current_loop = null;
         self.backend.deinit();
+    }
+
+    /// Debug-only: assert we're on the thread that owns this loop.
+    inline fn assertOwnThread(self: *const Loop) void {
+        if (in_debug_mode) std.debug.assert(current_loop == self);
     }
 
     pub fn stop(self: *Loop) void {
         self.state.stopped = true;
     }
 
+    /// Pop the next finished standalone completion awaiting user-callback
+    /// dispatch: every finished completion when the loop was created with
+    /// `do_not_call_callbacks`, and completions with a null callback always.
+    /// Returns null when drained; the caller invokes `completion.call(loop)`
+    /// or interprets the completion itself.
+    pub fn nextDispatched(self: *Loop) ?*Completion {
+        return self.state.dispatched.pop();
+    }
+
     pub fn stopped(self: *const Loop) bool {
         return self.state.stopped;
     }
 
+    /// Whether this loop has nothing left to do: every completion it owns
+    /// (`completion.loop == this`) has finished. An op may be *serviced* by
+    /// another loop of the group, but the active count stays with the owning
+    /// loop until the op finishes, so `done()` cannot report true early.
+    /// Completions handed out via `nextDispatched` are already finished and do
+    /// not keep the loop running.
     pub fn done(self: *const Loop) bool {
         return self.state.stopped or (self.state.loadActive() == 0 and self.state.completions.empty());
     }
@@ -636,58 +622,76 @@ pub const Loop = struct {
     pub fn setTimer(self: *Loop, timer: *Timer, timeout: Timeout) void {
         self.state.lockTimers();
         defer self.state.unlockTimers();
+        const st = timer.c.loadState();
+        // A running timer sits in its owning loop's heap; re-arming it here
+        // would remove it from this loop's heap instead and leak the owner's
+        // active count. Clear it on the owning loop first.
+        std.debug.assert(st.phase != .running or timer.c.getLoop() == self);
+        // A running timer with a result set is mid-fire (out of the heap, its
+        // markCompleted pending outside this lock); rearm from the callback
+        // (or after it), never concurrently with the fire.
+        std.debug.assert(!(st.phase == .running and timer.c.has_result));
         // Advance the scan so this timer's deadline is computed against a fresh
-        // `now` in its own clock (via `nowFor` in `setTimer`).
+        // `now` in its own clock (via `nowFor` in `armTimer`).
         self.state.updateNow();
-        timer.c.loop = self;
         timer.timeout = timeout;
-        self.state.setTimer(timer);
-    }
-
-    /// Clear a timer without completing it (works immediately, no cancellation completion required)
-    pub fn clearTimer(self: *Loop, timer: *Timer) void {
-        self.state.lockTimers();
-        defer self.state.unlockTimers();
-        const was_active = timer.c.state == .running;
-        self.state.clearTimer(timer);
-        if (was_active) {
-            // Reset state so timer can be reused
-            timer.c.state = .new;
+        if (st.phase == .running) {
+            self.state.disarmTimer(timer);
+        } else {
             timer.c.has_result = false;
             timer.c.err = null;
-            self.state.decrActive();
+            timer.c.setLoop(self);
+            _ = timer.c.enterRunning();
+            self.state.incrActive();
         }
+        self.state.armTimer(timer);
+    }
+
+    /// Clear a timer without completing it (works immediately, no cancellation
+    /// completion required). Thread-safe: may be called from a thread that does
+    /// not own the loop (a migrated task clearing its sleep timer).
+    ///
+    /// Returns true when the timer is the caller's again: it was disarmed here
+    /// (or was never armed), and its callback will not run. Returns false when
+    /// the timer is already on its way to completion, which means its callback
+    /// has run or is still to run, and both the timer and whatever its
+    /// `userdata` points at must stay alive until it does.
+    pub fn clearTimer(self: *Loop, timer: *Timer) bool {
+        self.state.lockTimers();
+        defer self.state.unlockTimers();
+        const st = timer.c.loadState();
+        // Not armed: `.new` is ours to hand back, anything else is a fired
+        // incarnation whose callback ran or is queued to run.
+        if (st.phase != .running) return st.phase == .new;
+        // A running timer that already has its result is in the fired/canceled
+        // limbo window: checkTimers (or cancelLocal) removed it from the heap
+        // and set its result under this lock, but its markCompleted runs after
+        // unlocking. It is already on its way to completion; leave it be.
+        if (timer.c.has_result) return false;
+        // A cancel pass claimed it (possibly on another loop's thread, still
+        // sitting in this loop's cancel queue); it owns the finish dispatch.
+        if (!timer.c.tryDisarm()) return false;
+        self.state.disarmTimer(timer);
+        self.state.decrActive();
+        return true;
     }
 
     /// Cancel a completion directly without requiring a Cancel completion struct.
     /// This is a fire-and-forget, idempotent operation - the completion's callback will still be
     /// invoked when the operation completes (either with error.Canceled or its natural result).
-    /// Thread-safe: can be called from any thread.
+    /// Must be called on this loop's own thread. The completion may be owned by a
+    /// different loop; cross-loop cancels are routed through its cancel queue.
     pub fn cancel(self: *Loop, completion: *Completion) void {
-        // Check if completion has been added to a loop
-        // (loop is set once by addInternal and never changes)
-        const target = completion.loop orelse {
-            // Not yet submitted - just set requested, addInternal will handle it
-            var old = completion.cancel_state.load(.acquire);
-            while (true) {
-                if (old.requested) return;
-                var new = old;
-                new.requested = true;
-                old = completion.cancel_state.cmpxchgWeak(old, new, .acq_rel, .acquire) orelse return;
-            }
-            return;
-        };
+        self.assertOwnThread();
 
-        // Atomically set requested and in_queue flags
-        var old = completion.cancel_state.load(.acquire);
-        while (true) {
-            if (old.requested) return; // Already requested
-            if (old.completed) return; // Already completed
-            var new = old;
-            new.requested = true;
-            new.in_queue = true;
-            old = completion.cancel_state.cmpxchgWeak(old, new, .acq_rel, .acquire) orelse break;
-        }
+        const old = completion.requestCancel();
+        // Nothing to route: already requested, too late, or not yet submitted
+        // (enterRunning picks the latched request up).
+        if (old.cancel_requested or old.phase != .running) return;
+
+        // The CAS observed `.running`, so the loop published by enterRunning
+        // is visible.
+        const target = completion.getLoop().?;
 
         if (self == target) {
             // Same loop - cancel directly
@@ -709,20 +713,14 @@ pub const Loop = struct {
     /// Cancel a completion on the local loop (must be called from the loop's thread)
     fn cancelLocal(self: *Loop, completion: *Completion) void {
         defer {
-            // Clear in_queue and call finishCompletion if completed
-            var old = completion.cancel_state.load(.acquire);
-            while (true) {
-                var new = old;
-                new.in_queue = false;
-                old = completion.cancel_state.cmpxchgWeak(old, new, .acq_rel, .acquire) orelse break;
-            }
-            if (old.completed) {
+            const old = completion.finishCancelPass();
+            if (old.phase == .completed) {
                 self.state.dispatchCompletion(completion);
             }
         }
 
-        // If already completed, skip cancel work (defer will still run)
-        if (completion.cancel_state.load(.acquire).completed) {
+        // Completed while queued, or disarmed in the meantime (timers)
+        if (completion.loadState().phase != .running) {
             return;
         }
 
@@ -739,9 +737,18 @@ pub const Loop = struct {
             },
             .timer => {
                 const timer = completion.cast(Timer);
-                timer.c.setError(error.Canceled);
                 self.state.lockTimers();
-                self.state.clearTimer(timer);
+                // Re-check under the lock: a cross-thread clearTimer may have
+                // disarmed it, or the fire may have won (mid-fire limbo:
+                // running with a result set, out of the heap already).
+                if (timer.c.loadState().phase != .running or timer.c.has_result) {
+                    self.state.unlockTimers();
+                    return;
+                }
+                // Set the result under the timer lock: clearTimer keys
+                // "already fired/canceled, hands off" on it.
+                timer.c.setError(error.Canceled);
+                self.state.disarmTimer(timer);
                 self.state.unlockTimers();
                 self.state.markCompleted(&timer.c);
             },
@@ -765,74 +772,72 @@ pub const Loop = struct {
             },
             .net_send_file => {
                 const op = completion.cast(NetSendFile);
-                if (comptime Backend.capabilities.net_send_file) {
-                    self.backend.cancel(&self.state, completion);
-                } else {
-                    self.netSendFileCancel(op);
+                switch (comptime Backend.capability(.net_send_file)) {
+                    .yes => self.backend.cancel(&self.state, completion),
+                    .no => self.netSendFileCancel(op),
+                    .maybe => switch (op.route) {
+                        .none => unreachable,
+                        .backend => self.backend.cancel(&self.state, completion),
+                        .fallback => self.netSendFileCancel(op),
+                    },
                 }
             },
 
             inline else => |op| {
-                // File/dir ops that can fallback to thread pool
-                if (@hasField(BackendCapabilities, @tagName(op))) {
-                    if (!@field(Backend.capabilities, @tagName(op))) {
-                        // Pollable streaming ops took the backend poll path, not
-                        // the thread pool, so they must be canceled there. The
-                        // verdict was cached on the op at submission time.
-                        if (comptime (op == .file_read_streaming or op == .file_write_streaming)) {
-                            if (completion.cast(op.toType()).pollable orelse false) {
-                                self.backend.cancel(&self.state, completion);
-                                return;
-                            }
-                        }
-                        // file_set_size may have been submitted natively (the
-                        // FTRUNCATE SQE) when the runtime probe found kernel
-                        // support, so it must be canceled on the backend, not the
-                        // thread pool. The probe verdict is stable for the process,
-                        // so re-querying here agrees with the submission decision.
-                        if (comptime op == .file_set_size and @hasDecl(Backend, "fileSetSizeSupported")) {
-                            if (self.backend.fileSetSizeSupported()) {
-                                self.backend.cancel(&self.state, completion);
-                                return;
-                            }
-                        }
-                        const thread_pool = self.thread_pool orelse unreachable;
-                        const op_data = completion.cast(op.toType());
-                        thread_pool.cancel(&op_data.internal.work);
-                        // If the worker is blocked in the canceled syscall, the
-                        // first SIGURG (sent by cancel above) can be lost in the
-                        // begin()->sleep window. Track it so `tick` re-sends until
-                        // the worker acknowledges. Only DelegatedWork ops have a
-                        // token; the entry is removed when the op finalizes.
-                        if (@hasField(@TypeOf(op_data.internal), "token")) {
-                            if (op_data.internal.token.isCanceling()) {
-                                self.state.addResend(&op_data.internal.work, completion);
-                            }
-                        }
-                    } else {
-                        self.backend.cancel(&self.state, completion);
-                    }
-                } else {
-                    // Backend operations (net_*, etc)
-                    self.backend.cancel(&self.state, completion);
+                const op_data = completion.cast(op.toType());
+                switch (comptime Backend.capability(op)) {
+                    .yes => self.backend.cancel(&self.state, completion),
+                    .no => self.cancelLinkedWork(completion, &op_data.linked_work),
+                    .maybe => switch (op_data.route) {
+                        .none => unreachable,
+                        .backend => self.backend.cancel(&self.state, completion),
+                        .fallback => self.cancelLinkedWork(completion, &op_data.linked_work),
+                    },
                 }
             },
         }
     }
 
-    pub fn run(self: *Loop, mode: RunMode) !void {
+    fn cancelLinkedWork(self: *Loop, completion: *Completion, linked_work: *DelegatedWork) void {
+        const thread_pool = self.thread_pool orelse unreachable;
+        thread_pool.cancel(&linked_work.work);
+        if (linked_work.token.isCanceling()) {
+            self.state.addResend(&linked_work.work, completion);
+        }
+    }
+
+    /// Cancel a thread-pool `work` that was submitted directly to the pool (not
+    /// through this loop), e.g. a blocking task. Loop-thread only.
+    pub fn cancelWork(self: *Loop, work: *Work) void {
+        const thread_pool = self.thread_pool orelse {
+            if (work.resend_release) |release| {
+                work.resend_release = null;
+                release(work);
+            }
+            return;
+        };
+        thread_pool.cancel(work);
+        if (work.cancel_token) |token| {
+            if (token.isCanceling()) {
+                self.state.addResend(work, &work.c);
+                return;
+            }
+        }
+        if (work.resend_release) |release| {
+            work.resend_release = null;
+            release(work);
+        }
+    }
+
+    pub fn run(self: *Loop) !void {
         std.debug.assert(self.state.initialized);
-        if (self.state.stopped) return;
-        switch (mode) {
-            .no_wait => try self.tick(false),
-            .once => try self.tick(true),
-            .until_done => while (!self.done()) {
-                try self.tick(true);
-            },
+        while (!self.done()) {
+            try self.poll(.max);
         }
     }
 
     pub fn add(self: *Loop, completion: *Completion) void {
+        self.assertOwnThread();
         if (in_safe_mode) {
             if (self.in_add) {
                 @panic("recursive call to Loop.add() is not allowed");
@@ -846,21 +851,19 @@ pub const Loop = struct {
     }
 
     fn addInternal(self: *Loop, completion: *Completion) void {
-        // If completion is dead (callback was called), reset it to new state for rearming
-        if (completion.state == .dead) {
+        completion.setLoop(self);
+        const old = completion.enterRunning();
+        if (old.phase == .dead) {
             completion.reset();
         }
+        self.state.incrActive();
 
-        std.debug.assert(completion.state == .new);
-
-        // Set the loop reference for cross-thread cancellation
-        @atomicStore(?*Loop, &completion.loop, self, .release);
-
-        if (completion.cancel_state.load(.acquire).requested) {
-            // Directly mark it as canceled
+        if (old.cancel_requested) {
+            // Groups cannot be canceled before submission
+            if (completion.op == .group) {
+                @panic("cannot cancel a group before adding it to the loop");
+            }
             completion.setError(error.Canceled);
-            self.state.incrActive();
-            completion.state = .running;
             self.state.markCompleted(completion);
             return;
         }
@@ -868,14 +871,6 @@ pub const Loop = struct {
         switch (completion.op) {
             .group => {
                 const group = completion.cast(Group);
-
-                // Groups cannot be canceled before submission
-                if (group.c.cancel_state.load(.acquire).requested) {
-                    @panic("cannot cancel a group before adding it to the loop");
-                }
-
-                group.c.state = .running;
-                self.state.incrActive();
 
                 if (group.remaining.load(.acquire) == 0) {
                     // Empty group - complete immediately
@@ -896,14 +891,12 @@ pub const Loop = struct {
             .timer => {
                 const timer = completion.cast(Timer);
                 self.state.lockTimers();
-                self.state.setTimer(timer);
+                self.state.armTimer(timer);
                 self.state.unlockTimers();
                 return;
             },
             .async => {
                 const async = completion.cast(Async);
-                async.c.state = .running;
-                self.state.incrActive();
 
                 // Check if already notified before submission
                 if (checkAndSetAsyncResult(async)) {
@@ -919,8 +912,6 @@ pub const Loop = struct {
                 const work = completion.cast(Work);
                 work.completion_fn = loopWorkComplete;
                 work.completion_context = @ptrCast(self);
-                work.c.state = .running;
-                self.state.incrActive();
                 if (self.thread_pool) |thread_pool| {
                     thread_pool.submit(work);
                 } else {
@@ -932,86 +923,38 @@ pub const Loop = struct {
             },
             .net_send_file => {
                 const op = completion.cast(NetSendFile);
-                completion.state = .running;
-                self.state.incrActive();
-                if (comptime Backend.capabilities.net_send_file) {
-                    self.state.incrInflight();
-                    self.backend.submit(&self.state, completion);
-                } else {
-                    netSendFileStart(self, op);
+                switch (comptime Backend.capability(.net_send_file)) {
+                    .yes => self.backend.submit(&self.state, completion),
+                    .no => netSendFileStart(self, op),
+                    .maybe => {
+                        if (self.backend.supports(.net_send_file, op)) {
+                            op.route = .backend;
+                            self.backend.submit(&self.state, completion);
+                        } else {
+                            op.route = .fallback;
+                            netSendFileStart(self, op);
+                        }
+                    },
                 }
                 return;
             },
             else => {
-                // Streaming reads/writes on a pollable fd (pipe/socket/FIFO/tty)
-                // use the backend readiness poll path instead of the thread pool.
-                // Seekable fds (regular files, block devices) fall back to the pool.
-                switch (completion.op) {
-                    inline .file_read_streaming, .file_write_streaming => |op| {
-                        // Classify lazily and cache the verdict on the op, so a
-                        // reused op (or the caller) can skip re-probing.
-                        const data = completion.cast(op.toType());
-                        const pollable = data.pollable orelse blk: {
-                            if (builtin.os.tag == .windows) {
-                                // A streaming op reaching the lazy path on Windows is a
-                                // handle zio did not open/classify (foreign, e.g. inherited
-                                // stdio reached via std.Io). Such handles are not associated
-                                // with our IOCP port, so the loop cannot drive them — route
-                                // to the thread pool's blocking read/write.
-                                data.pollable = false;
-                                break :blk false;
-                            }
-                            const p = common.probePollable(data.handle);
-                            data.pollable = p;
-                            break :blk p;
-                        };
-                        if (comptime !@field(Backend.capabilities, @tagName(op))) {
-                            // Route pollable fds to the backend readiness/overlapped path;
-                            // seekable fds (regular files, block devices) to the thread pool.
-                            if (pollable) {
-                                self.state.incrInflight();
-                                self.backend.submit(&self.state, completion);
-                            } else {
-                                self.submitFileOpToThreadPool(completion);
-                            }
-                            return;
-                        }
-                    },
-                    else => {},
-                }
-
-                // Ops a backend can handle natively only on some kernels (probed at
-                // runtime): if the backend advertises a runtime query and it says
-                // yes, use the native SQE path; otherwise fall through to the
-                // capability-based routing below (which sends it to the thread pool).
-                switch (completion.op) {
-                    .file_set_size => {
-                        if (comptime @hasDecl(Backend, "fileSetSizeSupported")) {
-                            if (self.backend.fileSetSizeSupported()) {
-                                self.state.incrInflight();
-                                self.backend.submit(&self.state, completion);
-                                return;
-                            }
-                        }
-                    },
-                    else => {},
-                }
-
-                // Regular backend operation
-                // Route file/dir ops to thread pool for backends without native support
                 switch (completion.op) {
                     inline else => |op| {
-                        if (@hasField(BackendCapabilities, @tagName(op))) {
-                            if (!@field(Backend.capabilities, @tagName(op))) {
+                        const op_data = completion.cast(op.toType());
+                        switch (comptime Backend.capability(op)) {
+                            .yes => self.backend.submit(&self.state, completion),
+                            .no => self.submitFileOpToThreadPool(completion),
+                            .maybe => if (self.backend.supports(op, op_data)) {
+                                op_data.route = .backend;
+                                self.backend.submit(&self.state, completion);
+                            } else {
+                                op_data.route = .fallback;
                                 self.submitFileOpToThreadPool(completion);
-                                return;
-                            }
+                            },
                         }
                     },
                 }
-
-                self.state.incrInflight();
-                self.backend.submit(&self.state, completion);
                 return;
             },
         }
@@ -1022,8 +965,10 @@ pub const Loop = struct {
         fired: bool,
     };
 
+    /// Fire every timer whose deadline has passed and report the earliest one
+    /// still pending. Scans against the current snapshot; `poll` owns the tick.
     fn checkTimers(self: *Loop) TimerCheckResult {
-        const native_wall = Backend.capabilities.native_wall_timers;
+        const native_wall = Backend.native_wall_timers;
 
         var fired = false;
         var next_timeout: ?Duration = null;
@@ -1033,16 +978,9 @@ pub const Loop = struct {
         var wall_deadline: [wall_clock_count]?u64 = .{ null, null, null };
         var wall_remaining: [wall_clock_count]Duration = .{ .zero, .zero, .zero };
 
-        // Advance the scan once and refresh the awake snapshot; this also
-        // invalidates the lazily-cached boot/real values for this scan.
-        // `now`/`tick` are only ever touched by the owning executor thread
-        // (`updateNow` is called here and in `setTimer`, both owner-thread; the
-        // cross-thread `clearTimer` never reads them), so no timer lock is needed.
-        self.state.updateNow();
-
         // Each wall-clock domain has its own heap, compared against `now` in
         // that clock. The earliest remaining across all domains becomes the
-        // poll timeout; `tick`'s caller caps it at `max_wait`, which bounds how
+        // poll timeout; `poll` caps it at `max_wait`, which bounds how
         // far a boot/real timer can oversleep after a suspend or clock step
         // (the re-read of `now(clock)` on the next scan corrects it).
         for (0..wall_clock_count) |idx| {
@@ -1090,7 +1028,7 @@ pub const Loop = struct {
                         break;
                     }
                     timer.c.setResult(.timer, {});
-                    self.state.clearTimer(timer);
+                    self.state.disarmTimer(timer);
                     batch[batch_count] = timer;
                     batch_count += 1;
                     if (batch_count >= batch.len) break;
@@ -1134,7 +1072,10 @@ pub const Loop = struct {
     /// Returns true if the async was pending and had its result set.
     /// Caller is responsible for managing queues and calling markCompleted.
     fn checkAndSetAsyncResult(async_handle: *Async) bool {
-        const was_pending = async_handle.pending.swap(0, .acquire);
+        // acq_rel: pairs with the swap in Async.notify (see the comment there).
+        // The release half publishes addInternal's setLoop to a notifier that
+        // misses this pending flag.
+        const was_pending = async_handle.pending.swap(0, .acq_rel);
         if (was_pending != 0) {
             async_handle.c.setResult(.async, {});
             return true;
@@ -1158,10 +1099,9 @@ pub const Loop = struct {
     /// Completion callback for internal file ops with linked completion
     pub fn loopLinkedWorkComplete(ctx: ?*anyopaque, work: *Work) void {
         const context: *LinkedWorkContext = @ptrCast(@alignCast(ctx));
-        // Copy out of the context before publishing the linked completion:
-        // the context lives in the op's frame, and the push makes the
-        // completion consumable by the loop thread, which can finish the op
-        // and reuse that frame before the wake below runs.
+        // Publishing `linked` hands the containing operation back to the loop;
+        // its waiter may then resume and free that operation before this worker
+        // returns. Snapshot everything stored in the operation before the push.
         const loop = context.loop;
         const linked = context.linked;
         // Propagate cancel error from work to linked completion
@@ -1218,7 +1158,7 @@ pub const Loop = struct {
             const next = completion.cancel_next;
             completion.cancel_next = null;
 
-            // cancelLocal handles completed check and clears in_queue
+            // cancelLocal re-checks the phase and clears cancel_inflight
             self.cancelLocal(completion);
 
             c = next;
@@ -1229,19 +1169,14 @@ pub const Loop = struct {
         const tp = self.thread_pool orelse {
             // No thread pool - complete with error
             log.err("No thread pool available for file operation", .{});
-            completion.state = .running;
-            self.state.incrActive();
             completion.setError(error.Unexpected);
             self.state.markCompleted(completion);
             return;
         };
 
-        completion.state = .running;
-        self.state.incrActive();
-
         switch (completion.op) {
             inline .file_open, .file_create, .file_close, .file_read, .file_write, .file_read_streaming, .file_write_streaming, .file_sync, .file_set_size, .file_set_permissions, .file_set_owner, .file_set_timestamps, .dir_create_dir, .dir_rename, .dir_rename_preserve, .dir_delete_file, .dir_delete_dir, .file_size, .file_stat, .dir_open, .dir_close, .dir_read, .dir_set_permissions, .dir_set_owner, .dir_set_file_permissions, .dir_set_file_owner, .dir_set_file_timestamps, .dir_sym_link, .dir_read_link, .dir_hard_link, .dir_access, .dir_real_path, .dir_real_path_file, .file_real_path, .file_hard_link, .device_io_control, .process_wait => |op| {
-                if (@field(Backend.capabilities, @tagName(op))) {
+                if (comptime Backend.capability(op) == .yes) {
                     unreachable;
                 }
 
@@ -1287,23 +1222,16 @@ pub const Loop = struct {
                 };
 
                 const op_data = completion.cast(op.toType());
-                if (@hasField(@TypeOf(op_data.internal), "allocator")) {
-                    op_data.internal.allocator = self.allocator;
-                }
-                op_data.internal.linked_context = .{
+                op_data.linked_work.allocator = self.allocator;
+                op_data.linked_work.linked_context = .{
                     .loop = self,
                     .linked = completion,
                 };
-                op_data.internal.work = Work.init(op_func, null);
-                op_data.internal.work.completion_fn = loopLinkedWorkComplete;
-                op_data.internal.work.completion_context = @ptrCast(&op_data.internal.linked_context);
-                // Ops whose internal is a DelegatedWork carry a cancellation
-                // token: bind it to the work so the worker enters/exits it and
-                // the blocking syscall becomes SIGURG-cancelable.
-                if (@hasField(@TypeOf(op_data.internal), "token")) {
-                    op_data.internal.work.cancel_token = &op_data.internal.token;
-                }
-                tp.submit(&op_data.internal.work);
+                op_data.linked_work.work = Work.init(op_func, null);
+                op_data.linked_work.work.completion_fn = loopLinkedWorkComplete;
+                op_data.linked_work.work.completion_context = @ptrCast(&op_data.linked_work.linked_context);
+                op_data.linked_work.work.cancel_token = &op_data.linked_work.token;
+                tp.submit(&op_data.linked_work.work);
             },
             else => unreachable,
         }
@@ -1324,17 +1252,17 @@ pub const Loop = struct {
     // from the same start, so buffers are sent in the order they were read.
 
     fn netSendFileStart(self: *Loop, op: *NetSendFile) void {
-        op.internal = .{};
-        op.internal.read_remaining = op.remaining;
+        op.fallback = .{};
+        op.fallback.read_remaining = op.remaining;
         // Lay out the working buffers from the (up to two) caller buffers. When
         // the result's bufs[1] is empty the index flips are suppressed (see
         // netSendFileStartRead / netSendFileOnSend), so the loop runs serially.
-        op.internal.bufs = sendfileLayout(op.bufs);
+        op.fallback.bufs = sendfileLayout(op.bufs);
         self.netSendFileAdvance(op);
     }
 
     fn netSendFileStartRead(self: *Loop, op: *NetSendFile) void {
-        const f = &op.internal;
+        const f = &op.fallback;
         const idx = f.next_read;
         const want = @min(f.bufs[idx].len, f.read_remaining);
         f.reading = idx;
@@ -1346,7 +1274,7 @@ pub const Loop = struct {
     }
 
     fn netSendFileStartSend(self: *Loop, op: *NetSendFile, idx: u1, from: usize) void {
-        const f = &op.internal;
+        const f = &op.fallback;
         f.sending = idx;
         f.send = NetSend.init(op.handle, WriteBuf.fromSlice(f.bufs[idx][from..f.filled[idx]], &f.send_iov), .{});
         f.send.c.userdata = op;
@@ -1358,15 +1286,15 @@ pub const Loop = struct {
     /// re-enter `netSendFileAdvance`, which finishes the parent only once both
     /// have drained.
     fn netSendFileCancel(self: *Loop, op: *NetSendFile) void {
-        if (op.internal.reading != null) self.cancel(&op.internal.read.c);
-        if (op.internal.sending != null) self.cancel(&op.internal.send.c);
+        if (op.fallback.reading != null) self.cancel(&op.fallback.read.c);
+        if (op.fallback.sending != null) self.cancel(&op.fallback.send.c);
     }
 
     fn netSendFileAdvance(self: *Loop, op: *NetSendFile) void {
-        const f = &op.internal;
+        const f = &op.fallback;
 
         // A cancel that arrived between callbacks turns into a parked error.
-        if (op.c.cancel_state.load(.acquire).requested and f.pending_err == null) {
+        if (op.c.loadState().cancel_requested and f.pending_err == null) {
             f.pending_err = error.Canceled;
         }
 
@@ -1402,7 +1330,7 @@ pub const Loop = struct {
 
     fn netSendFileOnRead(loop: *Loop, child: *Completion) void {
         const op: *NetSendFile = @ptrCast(@alignCast(child.userdata.?));
-        const f = &op.internal;
+        const f = &op.fallback;
         const idx = f.reading.?;
         f.reading = null;
         const n = child.cast(FileRead).getResult() catch |err| {
@@ -1422,7 +1350,7 @@ pub const Loop = struct {
 
     fn netSendFileOnSend(loop: *Loop, child: *Completion) void {
         const op: *NetSendFile = @ptrCast(@alignCast(child.userdata.?));
-        const f = &op.internal;
+        const f = &op.fallback;
         const idx = f.sending.?;
         const m = child.cast(NetSend).getResult() catch |err| {
             f.sending = null;
@@ -1444,13 +1372,24 @@ pub const Loop = struct {
     }
 
     fn netSendFileFinish(self: *Loop, op: *NetSendFile, err: ?anyerror) void {
-        if (err) |e| op.c.setError(e) else op.c.setResult(.net_send_file, op.internal.total);
+        if (err) |e| op.c.setError(e) else op.c.setResult(.net_send_file, op.fallback.total);
         self.state.markCompleted(&op.c);
     }
 
-    pub fn tick(self: *Loop, wait: bool) !void {
+    /// Process one batch of events: expire timers, poll the backend for
+    /// completions, run callbacks. `wait_cap` bounds how long the backend poll
+    /// may block: `.zero` never blocks (and skips the poll syscall entirely
+    /// when nothing is in flight), `.max` waits for the next event, anything
+    /// in between caps the wait at that duration (the executor's idle doze).
+    /// Timer deadlines, pending completions, and the loop's `max_wait` option
+    /// can all shorten the wait; they never lengthen it.
+    pub fn poll(self: *Loop, wait_cap: Duration) !void {
+        std.debug.assert(self.state.initialized);
         if (self.done()) return;
 
+        const wait = wait_cap.value != 0;
+
+        self.state.updateNow();
         const timer_result = self.checkTimers();
 
         // Re-send SIGURG to any worker still blocked in a canceled syscall.
@@ -1473,13 +1412,21 @@ pub const Loop = struct {
             if (self.state.cancel_resend != null and timeout.value > resend_interval.value) {
                 timeout = resend_interval;
             }
+            if (wait_cap.value < timeout.value) {
+                timeout = wait_cap;
+            }
         }
 
-        // Skip backend poll in no_wait mode if there's nothing to retrieve.
+        // Skip the backend poll when not waiting and there's nothing to retrieve.
         // This avoids syscall overhead for pure CPU-bound workloads.
-        const should_poll = wait or self.state.loadInflight() > 0;
+        const should_poll = wait or self.backend.hasInflight();
         const wake_flags = self.state.wake_requested.swap(0, .acq_rel);
         const timed_out = if (should_poll) try self.backend.poll(&self.state, if (wake_flags != 0) .zero else timeout) else false;
+
+        // The backend poll is the only place the loop sleeps, so the snapshot
+        // is stale by the whole sleep here. Refresh before anything that can
+        // arm a timer: the callbacks below, and the caller's task batch.
+        self.state.updateNow();
 
         // Process async handles if the async bit was set
         if (wake_flags & LoopState.wake_async != 0) {
@@ -1494,7 +1441,8 @@ pub const Loop = struct {
         // Process any work completions from thread pool
         self.processCompletions();
 
-        // Only check timers again if we timed out (avoids syscall when woken by I/O)
+        // Only if we timed out: the timeout was the earliest deadline, so
+        // waking ahead of it means nothing has expired.
         if (timed_out) {
             _ = self.checkTimers();
         }

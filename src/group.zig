@@ -4,7 +4,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const log = @import("common.zig").log;
-const Waiter = @import("common.zig").Waiter;
+const common = @import("common.zig");
+const Waiter = common.Waiter;
 const meta = @import("meta.zig");
 const Runtime = @import("runtime.zig").Runtime;
 const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
@@ -15,7 +16,8 @@ const JoinHandle = @import("runtime.zig").JoinHandle;
 const WaitQueue = @import("utils/wait_queue.zig").WaitQueue;
 const Awaitable = @import("awaitable.zig").Awaitable;
 const spawnTask = @import("task.zig").spawnTask;
-const spawnBlockingTask = @import("blocking_task.zig").spawnBlockingTask;
+const spawnBlockingTask_mod = @import("blocking_task.zig");
+const spawnBlockingTask = spawnBlockingTask_mod.spawnBlockingTask;
 const Futex = @import("sync/Futex.zig");
 
 pub const Group = struct {
@@ -108,10 +110,6 @@ pub const Group = struct {
         return (@atomicLoad(u32, self.getState(), .acquire) & fail_fast_bit) != 0;
     }
 
-    fn setClosed(self: *Group) void {
-        _ = @atomicRmw(u32, self.getState(), .Or, closed_bit, .acq_rel);
-    }
-
     fn isClosed(self: *Group) bool {
         return (@atomicLoad(u32, self.getState(), .acquire) & closed_bit) != 0;
     }
@@ -150,7 +148,7 @@ pub const Group = struct {
         const ReturnType = @typeInfo(@TypeOf(func)).@"fn".return_type.?;
         const Context = struct { group: *Group, args: Args };
         const Wrapper = struct {
-            fn start(ctx: *const anyopaque, _: *anyopaque) void {
+            fn start(ctx: *const anyopaque) void {
                 const context: *const Context = @ptrCast(@alignCast(ctx));
                 const group = context.group;
                 if (@typeInfo(ReturnType) == .error_union) {
@@ -169,11 +167,21 @@ pub const Group = struct {
         };
 
         const context: Context = .{ .group = self, .args = args };
-        return groupSpawnBlockingTask(self, rt, std.mem.asBytes(&context), .fromByteUnits(@alignOf(Context)), &Wrapper.start);
+        return groupSpawnBlockingTask(self, rt, std.mem.asBytes(&context), .fromByteUnits(@alignOf(Context)), &Wrapper.start, .{});
     }
 
+    /// Wait for every task currently in the group to finish.
+    ///
+    /// The group stays usable: it can be spawned into again afterwards, and
+    /// waited on again, which matches `std.Io.Threaded` and the `select`-based
+    /// wait. Tasks spawned while this is running are waited for too, though the
+    /// caller has to make sure such a spawn happens before the group drains,
+    /// otherwise the wait can return without having seen it.
+    ///
+    /// Neither this nor `cancel` closes a group permanently: `cancel` clears the
+    /// flag again on its way out, so a canceled group is reusable too. Only a
+    /// failure or cancelation with `fail_fast` set leaves a group closed.
     pub fn wait(group: *Group) Cancelable!void {
-        group.setClosed();
         errdefer group.cancel();
 
         // Wait for all tasks to complete
@@ -231,38 +239,77 @@ pub const Group = struct {
 
     pub const Result = void;
 
-    pub const WaitContext = Futex.FutexWaiter;
+    pub const WaitContext = struct {
+        fw: Futex.FutexWaiter = .{},
+        registered: bool = false,
+        /// A wake was dispatched for a dequeued registration but never
+        /// reported to the caller (the arm's claim lost before it could be):
+        /// asyncCancelWait must keep reporting it as an in-flight signal so
+        /// the caller's cleanup outwaits it.
+        pending_signal: bool = false,
+    };
 
     pub fn getResult(self: *Group, ctx: *WaitContext) void {
         _ = self;
         _ = ctx;
     }
 
-    pub fn asyncWait(self: *Group, waiter: *Waiter, ctx: *WaitContext) bool {
+    pub fn asyncWait(self: *Group, waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
         const state_ptr = self.getState();
 
+        // Unhook any previous registration so a re-poll never
+        // double-registers; one that is already gone was dequeued and
+        // signaled by a completion without a claim. The signal stays owed
+        // (pending_signal) until a return value reports it to the caller.
+        const had_signal = ctx.pending_signal or (ctx.registered and !Futex.cancelWait(&ctx.fw));
+        ctx.registered = false;
+        ctx.pending_signal = had_signal;
+
         // Fast path: no pending tasks means the group is already "complete".
-        if (@atomicLoad(u32, state_ptr, .acquire) & counter_mask == 0) return false;
+        if (@atomicLoad(u32, state_ptr, .acquire) & counter_mask == 0) {
+            return switch (waiter.tryClaim()) {
+                .won => blk: {
+                    ctx.pending_signal = false;
+                    break :blk if (had_signal) .ready_signaled else .ready;
+                },
+                .busy => unreachable,
+                .lost => .decided,
+            };
+        }
 
         // Park on the completion futex address.
-        Futex.prepareWait(state_ptr, ctx, waiter);
+        Futex.prepareWait(state_ptr, &ctx.fw, waiter);
+        ctx.registered = true;
 
         // Double-check: the last task may have completed (and issued its wake)
         // between the fast-path check and our registration above.
         if (@atomicLoad(u32, state_ptr, .acquire) & counter_mask == 0) {
             // We removed ourselves before any wake -> already complete.
-            if (Futex.cancelWait(ctx)) return false;
-            // A concurrent completion already dequeued us; the wake is in-flight.
-            return true;
+            if (Futex.cancelWait(&ctx.fw)) {
+                ctx.registered = false;
+                return switch (waiter.tryClaim()) {
+                    .won => blk: {
+                        ctx.pending_signal = false;
+                        break :blk if (had_signal) .ready_signaled else .ready;
+                    },
+                    .busy => unreachable,
+                    .lost => .decided,
+                };
+            }
+            // A concurrent completion already dequeued us; the wake (and its
+            // claim attempt) is in-flight.
         }
 
-        return true;
+        ctx.pending_signal = false;
+        return if (had_signal) .requeued else .queued;
     }
 
     pub fn asyncCancelWait(self: *Group, waiter: *Waiter, ctx: *WaitContext) bool {
         _ = self;
         _ = waiter;
-        return Futex.cancelWait(ctx);
+        if (ctx.pending_signal) return false;
+        if (!ctx.registered) return true;
+        return Futex.cancelWait(&ctx.fw);
     }
 };
 
@@ -279,21 +326,22 @@ pub fn groupSpawnTask(
 }
 
 /// Spawn a blocking task in the group with raw context bytes and start function.
-/// Used by Group.spawnBlocking.
+/// Used by Group.spawnBlocking and std.Io vtable implementations.
 pub fn groupSpawnBlockingTask(
     group: *Group,
     rt: *Runtime,
     context: []const u8,
     context_alignment: std.mem.Alignment,
-    start: *const fn (context: *const anyopaque, result: *anyopaque) void,
+    start: *const fn (context: *const anyopaque) void,
+    options: spawnBlockingTask_mod.SpawnOptions,
 ) !void {
-    _ = try spawnBlockingTask(rt, 0, .@"1", context, context_alignment, .{ .regular = start }, group);
+    _ = try spawnBlockingTask(rt, 0, .@"1", context, context_alignment, .{ .group = start }, group, options);
 }
 
 /// Register an awaitable with a group.
 /// Increments counter, sets group_node.group, and adds to task list.
 /// Returns error.Closed if group is closed.
-pub fn registerGroupTask(group: *Group, awaitable: *Awaitable) error{Closed}!void {
+pub fn registerGroupTask(group: *Group, awaitable: *Awaitable) Closeable!void {
     if (group.isClosed()) return error.Closed;
     const prev_state = @atomicRmw(u32, group.getState(), .Add, 1, .acq_rel);
     const prev_counter = prev_state & Group.counter_mask;
@@ -337,6 +385,7 @@ pub const GroupNode = struct {
 };
 
 const Cancelable = @import("common.zig").Cancelable;
+const Closeable = @import("common.zig").Closeable;
 
 fn testFn(arg: usize) usize {
     return arg + 1;
@@ -592,4 +641,80 @@ test "Group: wait() future protocol drains without closing" {
     // Not closed: can spawn again and drain a second time.
     try group.spawn(quick, .{});
     _ = try waitFuture(&group);
+}
+
+test "Group: failed spawnBlocking frees the task exactly once" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    // Make registerBlockingTask fail after the task has already been pushed
+    // into the group, which is the state a spawn racing with shutdown ends up
+    // in. The group's cleanup and spawnBlockingTask's errdefer must not both
+    // free the task. A large context takes the direct allocator path (over
+    // TaskPool.pool_item_size), so testing.allocator catches a double free.
+    rt.shutting_down.store(true, .release);
+
+    const bigWork = struct {
+        fn call(_: [3000]u8) void {}
+    }.call;
+
+    try std.testing.expectError(error.RuntimeShutdown, group.spawnBlocking(bigWork, .{@as([3000]u8, @splat(0))}));
+}
+
+test "Group: reusable after wait" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var counter: usize = 0;
+    const bump = struct {
+        fn call(c: *usize) void {
+            sleep(.fromMilliseconds(1)) catch {};
+            c.* += 1;
+        }
+    }.call;
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    // wait() used to close the group, which turned every later spawn into
+    // error.Closed (and, through the std.Io vtable, into silently running the
+    // work synchronously).
+    try group.spawn(bump, .{&counter});
+    try group.spawn(bump, .{&counter});
+    try group.wait();
+    try std.testing.expectEqual(2, counter);
+
+    try group.spawn(bump, .{&counter});
+    try group.wait();
+    try std.testing.expectEqual(3, counter);
+}
+
+test "Group: spawning while waiting" {
+    const rt = try Runtime.init(std.testing.allocator, .{});
+    defer rt.deinit();
+
+    var counter: usize = 0;
+    const spawner = struct {
+        fn bump(c: *usize) void {
+            c.* += 1;
+        }
+
+        fn call(group: *Group, c: *usize) void {
+            // Spawned into the group that our caller is waiting on. The wait
+            // must cover this task too, so the count is 2 when it returns.
+            sleep(.fromMilliseconds(1)) catch {};
+            group.spawn(bump, .{c}) catch {};
+            c.* += 1;
+        }
+    };
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(spawner.call, .{ &group, &counter });
+    try group.wait();
+    try std.testing.expectEqual(2, counter);
 }

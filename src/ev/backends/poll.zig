@@ -23,10 +23,85 @@ const PipeClose = @import("../completion.zig").PipeClose;
 
 pub const NetHandle = net.fd_t;
 
-const BackendCapabilities = @import("../completion.zig").BackendCapabilities;
+const Support = @import("../completion.zig").Support;
 const fs = @import("../../os/fs.zig");
 
-pub const capabilities: BackendCapabilities = .{};
+pub const native_wall_timers = false;
+pub const supports_nonblocking_file_io = false;
+
+pub fn capability(comptime op: Op) Support {
+    return switch (op) {
+        .file_read_streaming, .file_write_streaming => .maybe,
+        .net_send_file,
+        .file_open,
+        .file_create,
+        .file_close,
+        .file_read,
+        .file_write,
+        .file_sync,
+        .file_set_size,
+        .file_set_permissions,
+        .file_set_owner,
+        .file_set_timestamps,
+        .dir_create_dir,
+        .dir_rename,
+        .dir_rename_preserve,
+        .dir_delete_file,
+        .dir_delete_dir,
+        .file_size,
+        .file_stat,
+        .dir_open,
+        .dir_close,
+        .dir_set_permissions,
+        .dir_set_owner,
+        .dir_set_file_permissions,
+        .dir_set_file_owner,
+        .dir_set_file_timestamps,
+        .dir_sym_link,
+        .dir_read_link,
+        .dir_hard_link,
+        .dir_access,
+        .dir_read,
+        .dir_real_path,
+        .dir_real_path_file,
+        .file_real_path,
+        .file_hard_link,
+        .device_io_control,
+        .process_wait,
+        => .no,
+        .group,
+        .timer,
+        .async,
+        .work,
+        .net_open,
+        .net_bind,
+        .net_listen,
+        .net_connect,
+        .net_accept,
+        .net_recv,
+        .net_send,
+        .net_recvfrom,
+        .net_sendto,
+        .net_recvmsg,
+        .net_sendmsg,
+        .net_poll,
+        .net_shutdown,
+        .net_close,
+        .pipe_poll,
+        .pipe_create,
+        .pipe_close,
+        .mach_port,
+        => .yes,
+    };
+}
+
+pub fn supports(_: *const Self, comptime op: Op, data: *op.toType()) bool {
+    comptime std.debug.assert(capability(op) == .maybe);
+    if (comptime op == .file_read_streaming or op == .file_write_streaming) {
+        return common.resolveStreamingSupport(data);
+    }
+    @compileError("unhandled runtime poll capability: " ++ @tagName(op));
+}
 
 pub const SharedState = struct {};
 
@@ -62,6 +137,11 @@ waker_read_fd: net.fd_t = undefined,
 waker_write_fd: net.fd_t = undefined,
 queue_size: u16,
 pending_changes: usize = 0,
+/// Backend-internal inflight count: ops accepted by submit() and not yet
+/// completed. This backend is strictly per-loop (submit and completion on the
+/// owner thread), so a plain counter suffices. Read by hasInflight() to skip
+/// the poll syscall when nothing can arrive.
+inflight: usize = 0,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     _ = shared_state;
@@ -106,12 +186,31 @@ pub fn deinit(self: *Self) void {
 pub fn wake(self: *Self, state: *LoopState) void {
     _ = state;
     const byte: [1]u8 = .{1};
+    // A silently failed write strands the sleeping loop until its poll
+    // timeout: wake_requested is already set, so later wakers skip the
+    // syscall. A full pipe is fine (the pending bytes already make the
+    // waker fd readable); anything else means the waker is broken and
+    // every subsequent wake would be lost, so fail loudly.
     switch (builtin.os.tag) {
         .windows => {
-            _ = net.send(self.waker_write_fd, &[_]net.iovec_const{net.iovecConstFromSlice(&byte)}, .{}) catch {};
+            _ = net.send(self.waker_write_fd, &[_]net.iovec_const{net.iovecConstFromSlice(&byte)}, .{}) catch |err| switch (err) {
+                error.WouldBlock => {},
+                else => std.debug.panic("poll: waker send failed: {t}", .{err}),
+            };
         },
         else => {
-            _ = fs.write(self.waker_write_fd, &byte) catch {};
+            // Raw write, not fs.write: the waker runs on any thread and needs
+            // neither the cancel bracket nor its error surface.
+            while (true) {
+                const rc = posix.system.write(self.waker_write_fd, &byte, byte.len);
+                switch (posix.errno(rc)) {
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    // Full pipe: the pending bytes already make the fd readable.
+                    .AGAIN => break,
+                    else => |err| std.debug.panic("poll: waker write failed: {t}", .{err}),
+                }
+            }
         },
     }
 }
@@ -277,11 +376,25 @@ fn getHandle(completion: *Completion) NetHandle {
     };
 }
 
+/// Drop one inflight op. Called via LoopState.markCompletedFromBackend on the
+/// owner thread.
+pub fn decrInflight(self: *Self) void {
+    self.inflight -= 1;
+}
+
+/// Whether poll() could produce completions. Used by the loop to skip the
+/// wait syscall in no-wait ticks when nothing can arrive.
+pub fn hasInflight(self: *const Self) bool {
+    return self.inflight > 0;
+}
+
 /// Submit a completion to the backend - infallible.
 /// On error, completes the operation immediately with error.Unexpected.
 pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
-    c.state = .running;
-    state.incrActive();
+    // Counted for every accepted op (sync completers decrement right back via
+    // markCompletedFromBackend), mirroring the decrInflight in every completion
+    // path so the balance needs no per-path reasoning.
+    self.inflight += 1;
 
     switch (c.op) {
         .group, .timer, .async, .work => unreachable, // Managed by the loop
@@ -466,7 +579,7 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
             iter = completion.next;
 
             // Skip if already completed (can happen with cancellations)
-            if (completion.state == .completed or completion.state == .dead) {
+            if (completion.loadState().phase != .running) {
                 continue;
             }
 
@@ -500,7 +613,7 @@ fn handlePollError(item: *const net.pollfd, comptime errnoToError: fn (net.E) an
 
     const sock_err = net.getSockError(item.fd) catch return error.Unexpected;
     if (sock_err == 0) return null; // No actual error, caller should retry operation
-    return errnoToError(@enumFromInt(sock_err));
+    return errnoToError(@fromBackingInt(@intCast(sock_err)));
 }
 
 fn checkSpuriousWakeup(result: anytype) CheckResult {

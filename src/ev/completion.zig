@@ -14,60 +14,25 @@ const Timestamp = @import("../time.zig").Timestamp;
 const Timeout = @import("../time.zig").Timeout;
 const Clock = @import("../time.zig").Clock;
 
-pub const BackendCapabilities = struct {
-    file_read: bool = false,
-    file_write: bool = false,
-    file_read_streaming: bool = false,
-    file_write_streaming: bool = false,
-    file_open: bool = false,
-    file_create: bool = false,
-    file_close: bool = false,
-    file_sync: bool = false,
-    file_set_size: bool = false,
-    file_set_permissions: bool = false,
-    file_set_owner: bool = false,
-    file_set_timestamps: bool = false,
-    dir_create_dir: bool = false,
-    dir_rename: bool = false,
-    dir_rename_preserve: bool = false,
-    dir_delete_file: bool = false,
-    dir_delete_dir: bool = false,
-    file_size: bool = false,
-    file_stat: bool = false,
-    dir_open: bool = false,
-    dir_close: bool = false,
-    dir_set_permissions: bool = false,
-    dir_set_owner: bool = false,
-    dir_set_file_permissions: bool = false,
-    dir_set_file_owner: bool = false,
-    dir_set_file_timestamps: bool = false,
-    dir_sym_link: bool = false,
-    dir_read_link: bool = false,
-    dir_hard_link: bool = false,
-    dir_access: bool = false,
-    dir_read: bool = false,
-    dir_real_path: bool = false,
-    dir_real_path_file: bool = false,
-    file_real_path: bool = false,
-    file_hard_link: bool = false,
-    /// When true, the backend implements file-to-socket transfer natively
-    /// (e.g. io_uring splice). When false, the loop drives a generic
-    /// read/write callback loop fallback (see NetSendFile).
-    net_send_file: bool = false,
-    device_io_control: bool = false,
-    process_wait: bool = false,
-    /// When true, completions submitted to one loop in a group may be completed
-    /// on another loop's thread. Timer operations are protected by a mutex.
-    is_multi_threaded: bool = false,
-    /// When true, the backend arms boot/real (wall-clock) timers natively via
-    /// `syncWallTimers`, so the loop must not fold them into the poll timeout.
-    /// When false, the loop falls back to the capped poll-timeout re-evaluation.
-    native_wall_timers: bool = false,
-
-    pub fn supportsNonBlockingFileIo(comptime self: BackendCapabilities) bool {
-        return self.file_read or self.file_write or self.file_read_streaming or self.file_write_streaming;
-    }
+/// Compile-time classification of where an operation can execute. `maybe`
+/// reserves both the backend scratch and fallback state; the Loop resolves the
+/// route against the initialized backend instance when the operation is added.
+pub const Support = enum {
+    yes,
+    no,
+    maybe,
 };
+
+/// The route selected for a `maybe` operation. It is recorded at submission so
+/// cancellation follows the original route rather than repeating a feature or
+/// handle probe whose answer might no longer describe the in-flight work.
+pub const ExecutionRoute = enum {
+    none,
+    backend,
+    fallback,
+};
+
+const NoRoute = enum { none };
 
 pub const Op = enum {
     group,
@@ -281,18 +246,21 @@ pub const Completion = struct {
     };
 
     op: Op,
-    state: State = .new,
+
+    /// One atomic word holding the lifecycle phase and the cancel flags; all
+    /// cross-thread races on a completion resolve through the modification
+    /// order of this word. Access only through the transition methods below.
+    state: std.atomic.Value(State) = .init(.{}),
 
     flags: Flags = .{},
 
     userdata: ?*anyopaque = null,
     callback: ?*const CallbackFn = null,
 
-    /// Loop this completion was submitted to (set by loop.add())
+    /// Loop this completion was submitted to. Monotonic accesses; visibility
+    /// comes from `state`: a thread that observed phase `.running` sees the
+    /// loop published by `enterRunning` (async notify pairs via `pending`).
     loop: ?*Loop = null,
-
-    /// Cross-thread cancellation state (atomic for thread-safe cancel)
-    cancel_state: std.atomic.Value(CancelState) = .init(.{}),
 
     /// Cancel queue intrusive linked list
     cancel_next: ?*Completion = null,
@@ -314,7 +282,9 @@ pub const Completion = struct {
     /// Stored here instead of in each operation type to simplify error handling.
     err: ?anyerror = null,
 
-    /// Whether a result has been set (for debugging/assertions).
+    /// Whether a result has been set. Written only by the servicing thread
+    /// (under the timer mutex for timers, where `.running` plus a result means
+    /// mid-fire).
     has_result: bool = false,
 
     /// Backend-specific internal data for async operations.
@@ -326,14 +296,15 @@ pub const Completion = struct {
     prev: ?*Completion = null,
     next: ?*Completion = null,
 
-    pub const State = enum { new, running, completed, dead };
+    pub const State = packed struct(u8) {
+        phase: Phase = .new,
+        /// Cancel was requested; backends poll it to stop retrying.
+        cancel_requested: bool = false,
+        /// A cancel pass (cancelLocal) owns the finish dispatch.
+        cancel_inflight: bool = false,
+        _reserved: u4 = 0,
 
-    /// Atomic state for cross-thread cancellation coordination
-    pub const CancelState = packed struct(u8) {
-        requested: bool = false, // Cancel was requested
-        in_queue: bool = false, // Completion is in cancel queue, queue will call finish
-        completed: bool = false, // markCompleted ran, result is set
-        _pad: u5 = 0,
+        pub const Phase = enum(u2) { new, running, completed, dead };
     };
 
     pub const CallbackFn = fn (
@@ -345,23 +316,120 @@ pub const Completion = struct {
         return .{ .op = op };
     }
 
+    pub fn setLoop(c: *Completion, loop: ?*Loop) void {
+        @atomicStore(?*Loop, &c.loop, loop, .monotonic);
+    }
+
+    pub fn getLoop(c: *const Completion) ?*Loop {
+        return @atomicLoad(?*Loop, &c.loop, .monotonic);
+    }
+
+    pub fn loadState(c: *const Completion) State {
+        return c.state.load(.monotonic);
+    }
+
+    /// {new,dead} -> running. Publishes the preceding `setLoop`. A cancel
+    /// latched before the first submission is kept; one aimed at a dead
+    /// incarnation is dropped on rearm. Returns the previous state.
+    pub fn enterRunning(c: *Completion) State {
+        var old = c.loadState();
+        while (true) {
+            std.debug.assert(old.phase == .new or old.phase == .dead);
+            std.debug.assert(!old.cancel_inflight);
+            const new_state: State = .{
+                .phase = .running,
+                .cancel_requested = old.cancel_requested and old.phase == .new,
+            };
+            old = c.state.cmpxchgWeak(old, new_state, .acq_rel, .monotonic) orelse return old;
+        }
+    }
+
+    /// running -> completed. Returns the previous state; `cancel_inflight` in
+    /// it means a cancel pass owns the dispatch.
+    pub fn enterCompleted(c: *Completion) State {
+        var old = c.loadState();
+        while (true) {
+            if (old.phase != .running) {
+                std.debug.panic(
+                    "zio: enterCompleted invariant violated: op={s} phase={s} (double completion)",
+                    .{ @tagName(c.op), @tagName(old.phase) },
+                );
+            }
+            var new_state = old;
+            new_state.phase = .completed;
+            old = c.state.cmpxchgWeak(old, new_state, .acq_rel, .monotonic) orelse return old;
+        }
+    }
+
+    /// completed -> dead, keeping `cancel_requested` so callbacks can see it.
+    /// No concurrent writers remain at this point.
+    pub fn enterDead(c: *Completion) void {
+        const old = c.loadState();
+        if (old.phase != .completed) {
+            std.debug.panic(
+                "zio: enterDead invariant violated: op={s} phase={s} (double dispatch)",
+                .{ @tagName(c.op), @tagName(old.phase) },
+            );
+        }
+        c.state.store(.{ .phase = .dead, .cancel_requested = old.cancel_requested }, .monotonic);
+    }
+
+    /// running -> new (disarm a timer without completing it). A latched cancel
+    /// request is kept for the next incarnation, exactly as if it had arrived
+    /// while the completion sat in `.new`.
+    ///
+    /// Fails when a cancel pass has claimed the completion: that pass owns the
+    /// finish dispatch, and clearing `cancel_inflight` under it would let both
+    /// it and the next incarnation dispatch the same completion.
+    pub fn tryDisarm(c: *Completion) bool {
+        var old = c.loadState();
+        while (true) {
+            std.debug.assert(old.phase == .running);
+            if (old.cancel_inflight) return false;
+            const new_state: State = .{ .phase = .new, .cancel_requested = old.cancel_requested };
+            old = c.state.cmpxchgWeak(old, new_state, .acq_rel, .monotonic) orelse return true;
+        }
+    }
+
+    /// Latch a cancel request. Returns the previous state: phase `.running`
+    /// without `cancel_requested` means the caller latched `cancel_inflight`
+    /// and must run (or route) the cancel pass. On `.new` only the request is
+    /// latched; `enterRunning` picks it up. Completed/dead: too late, no-op.
+    pub fn requestCancel(c: *Completion) State {
+        var old = c.loadState();
+        while (true) {
+            if (old.cancel_requested) return old;
+            if (old.phase == .completed or old.phase == .dead) return old;
+            var new_state = old;
+            new_state.cancel_requested = true;
+            new_state.cancel_inflight = old.phase == .running;
+            old = c.state.cmpxchgWeak(old, new_state, .acq_rel, .monotonic) orelse return old;
+        }
+    }
+
+    /// Clear `cancel_inflight` at the end of a cancel pass. Returns the
+    /// previous state: phase `.completed` means the completion finished during
+    /// the pass and the caller owns its dispatch.
+    pub fn finishCancelPass(c: *Completion) State {
+        const mask: u8 = @bitCast(State{ .cancel_inflight = true });
+        return @bitCast(@atomicRmw(u8, @as(*u8, @ptrCast(&c.state.raw)), .And, ~mask, .acq_rel));
+    }
+
+    /// Clear per-incarnation fields when re-adding a dead completion.
+    ///
+    /// `group` is not one of them: it is membership state belonging to whoever
+    /// linked the completion, and its links are maintained by that owner. A
+    /// caller that links and then arms - `CompletionQueue.submit`, the batch
+    /// path in `io.zig` - would have its bookkeeping erased here.
+    ///
+    /// Ownership is sticky: a completion that has been in a group or a queue
+    /// stays marked as that owner's until it is re-initialised. Its owner may
+    /// arm it again (a queue re-submitting a finished completion does), anyone
+    /// else must `init` it first.
     pub fn reset(c: *Completion) void {
-        c.state = .new;
         c.has_result = false;
         c.err = null;
-        // `loop` is kept: Async.notify() reads it cross-thread, and a null
-        // window during a rearm re-add loses the wake. A stale pointer only
-        // causes a spurious wake, and add() overwrites it.
-        c.cancel_state.store(.{}, .release);
         c.cancel_next = null;
-        c.group.next = null;
-        c.group.prev = null;
-        c.group.owner = null;
-        c.group.owner_callback = null;
-        c.group.userdata = 0;
-        if (std.debug.runtime_safety) {
-            c.group.in_list = false;
-        }
     }
 
     pub fn call(c: *Completion, loop: *Loop) void {
@@ -392,8 +460,8 @@ pub const Completion = struct {
     pub fn setError(c: *Completion, err: anyerror) void {
         if (c.has_result) {
             std.debug.panic(
-                "zio: setError on completion that already has a result: op={s} state={s} err={?s} (result set twice)",
-                .{ @tagName(c.op), @tagName(c.state), if (c.err) |e| @errorName(e) else null },
+                "zio: setError on completion that already has a result: op={s} phase={s} err={?s} (result set twice)",
+                .{ @tagName(c.op), @tagName(c.loadState().phase), if (c.err) |e| @errorName(e) else null },
             );
         }
         c.err = err;
@@ -403,8 +471,8 @@ pub const Completion = struct {
     pub fn setResult(c: *Completion, comptime op: Op, result: @FieldType(op.toType(), "result_private_do_not_touch")) void {
         if (c.has_result or c.op != op) {
             std.debug.panic(
-                "zio: setResult invariant violated: op={s} wanted={s} state={s} has_result={}",
-                .{ @tagName(c.op), @tagName(op), @tagName(c.state), c.has_result },
+                "zio: setResult invariant violated: op={s} wanted={s} phase={s} has_result={}",
+                .{ @tagName(c.op), @tagName(op), @tagName(c.loadState().phase), c.has_result },
             );
         }
         const T = op.toType();
@@ -437,8 +505,8 @@ pub const Group = struct {
 
     /// Add a completion to this group. Must be called before submitting the group.
     pub fn add(self: *Group, c: *Completion) void {
-        std.debug.assert(c.state == .new);
-        std.debug.assert(self.c.state == .new); // Group must not be submitted yet
+        std.debug.assert(c.loadState().phase == .new);
+        std.debug.assert(self.c.loadState().phase == .new); // Group must not be submitted yet
         std.debug.assert(c.group.owner == null);
         std.debug.assert(!c.flags.rearm); // groups are single-shot
         c.group.next = self.head;
@@ -479,7 +547,7 @@ pub const Group = struct {
 
         const prev = self.remaining.fetchSub(1, .acq_rel);
         if (prev == 1) {
-            if (self.c.cancel_state.load(.acquire).requested) {
+            if (self.c.loadState().cancel_requested) {
                 self.c.setError(error.Canceled);
             } else {
                 self.c.setResult(.group, {});
@@ -541,12 +609,15 @@ pub const Async = struct {
 
     /// Notify the loop to wake up and complete this async handle (thread-safe)
     pub fn notify(self: *Async) void {
-        // Atomically set pending flag
-        const was_pending = self.pending.swap(1, .release);
+        // Pairs with the `pending` swap in Loop.add: both are acq_rel RMWs on
+        // the same variable, so they order against each other. If add's swap
+        // came first, the acquire here makes its setLoop visible and we wake
+        // the loop; if ours came first, add sees `pending` set and completes
+        // the handle itself. Reading a null loop therefore proves add will
+        // handle it.
+        const was_pending = self.pending.swap(1, .acq_rel);
         if (was_pending == 0) {
-            // Only notify loop if transitioning from not-pending to pending
-            // If loop is not set (never added), this is a no-op
-            if (@atomicLoad(?*Loop, &self.c.loop, .acquire)) |loop| {
+            if (self.c.getLoop()) |loop| {
                 loop.wakeAsync();
             }
         }
@@ -590,6 +661,13 @@ pub const Work = struct {
     /// owning loop's thread.
     resend_next: ?*Work = null,
     resend_key: ?*Completion = null,
+
+    /// Optional hook fired when this work leaves the cancel-resend list (the
+    /// worker acknowledged the cancel). Used by pool-direct work that is not a
+    /// loop-managed completion — e.g. a blocking task — to drop the reference it
+    /// held to keep the work alive across the resend window. Called once, on the
+    /// loop thread, after the entry is unlinked. Null for loop-managed work.
+    resend_release: ?*const fn (work: *Work) void = null,
 
     pub const Error = error{NoThreadPool} || Cancelable;
 
@@ -854,10 +932,9 @@ pub const NetSendFile = struct {
     /// writer's buffer and the reader's buffer). Unused by native backends.
     bufs: [2][]u8,
 
-    internal: switch (Backend.capabilities.net_send_file) {
-        true => if (@hasDecl(Backend, "NetSendFileData")) Backend.NetSendFileData else struct {},
-        false => Fallback,
-    } = .{},
+    internal: BackendOpData(.net_send_file, "NetSendFileData") = .{},
+    fallback: if (Backend.capability(.net_send_file) != .yes) Fallback else struct {} = .{},
+    route: RouteData(.net_send_file) = .none,
 
     /// State for the generic read/write loop. Unused by native backends.
     pub const Fallback = struct {
@@ -1065,14 +1142,11 @@ pub const FileOpenResult = struct {
     pollable: bool = false,
 };
 
-/// Shared `internal` payload for file/dir ops delegated to the thread pool on
-/// backends without native async support (kqueue/poll). Bundles the pool `Work`,
-/// the loop linkage, an allocator slot (used by path-based ops), and the syscall
-/// cancellation token bound by the worker. The cancel-resend list link lives on
-/// the embedded `work` (see `Work.resend_next`/`resend_key`); `linked_context.linked`
-/// back-points to the owning `Completion` and is used as the work's `resend_key`,
-/// so the loop finds the entry from a completion at finalization without any
-/// per-op-type knowledge.
+/// State for file/dir operations delegated to the thread pool. This is Loop
+/// fallback state, deliberately separate from a backend's `internal` scratch.
+/// `linked_context.linked` back-points to the owning Completion, so worker
+/// callbacks and the cancel-resend machinery need no per-operation container
+/// layout knowledge.
 pub const DelegatedWork = struct {
     work: Work = undefined,
     allocator: std.mem.Allocator = undefined,
@@ -1084,13 +1158,26 @@ pub const DelegatedWork = struct {
     token: os.syscall_cancel.Token = .{},
 };
 
+fn BackendOpData(comptime op: Op, comptime decl_name: []const u8) type {
+    if (Backend.capability(op) == .no) return struct {};
+    if (@hasDecl(Backend, decl_name)) return @field(Backend, decl_name);
+    return struct {};
+}
+
+fn LinkedWorkData(comptime op: Op) type {
+    return if (Backend.capability(op) != .yes) DelegatedWork else struct {};
+}
+
+fn RouteData(comptime op: Op) type {
+    return if (Backend.capability(op) == .maybe) ExecutionRoute else NoRoute;
+}
+
 pub const FileOpen = struct {
     c: Completion,
     result_private_do_not_touch: FileOpenResult = undefined,
-    internal: switch (Backend.capabilities.file_open) {
-        true => if (@hasDecl(Backend, "FileOpenData")) Backend.FileOpenData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_open, "FileOpenData") = .{},
+    linked_work: LinkedWorkData(.file_open) = .{},
+    route: RouteData(.file_open) = .none,
     dir: fs.fd_t,
     path: []const u8,
     flags: fs.FileOpenFlags,
@@ -1114,10 +1201,9 @@ pub const FileOpen = struct {
 pub const FileCreate = struct {
     c: Completion,
     result_private_do_not_touch: FileOpenResult = undefined,
-    internal: switch (Backend.capabilities.file_create) {
-        true => if (@hasDecl(Backend, "FileCreateData")) Backend.FileCreateData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_create, "FileCreateData") = .{},
+    linked_work: LinkedWorkData(.file_create) = .{},
+    route: RouteData(.file_create) = .none,
     dir: fs.fd_t,
     path: []const u8,
     flags: fs.FileCreateFlags,
@@ -1141,10 +1227,9 @@ pub const FileCreate = struct {
 pub const FileClose = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.file_close) {
-        true => if (@hasDecl(Backend, "FileCloseData")) Backend.FileCloseData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_close, "FileCloseData") = .{},
+    linked_work: LinkedWorkData(.file_close) = .{},
+    route: RouteData(.file_close) = .none,
     handle: fs.fd_t,
 
     pub const Error = fs.FileCloseError || Cancelable;
@@ -1164,10 +1249,9 @@ pub const FileClose = struct {
 pub const FileRead = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.file_read) {
-        true => if (@hasDecl(Backend, "FileReadData")) Backend.FileReadData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_read, "FileReadData") = .{},
+    linked_work: LinkedWorkData(.file_read) = .{},
+    route: RouteData(.file_read) = .none,
     handle: fs.fd_t,
     buffer: ReadBuf,
     offset: u64,
@@ -1191,10 +1275,9 @@ pub const FileRead = struct {
 pub const FileWrite = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.file_write) {
-        true => if (@hasDecl(Backend, "FileWriteData")) Backend.FileWriteData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_write, "FileWriteData") = .{},
+    linked_work: LinkedWorkData(.file_write) = .{},
+    route: RouteData(.file_write) = .none,
     handle: fs.fd_t,
     buffer: WriteBuf,
     offset: u64,
@@ -1218,16 +1301,16 @@ pub const FileWrite = struct {
 pub const FileReadStreaming = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.file_read_streaming) {
-        true => if (@hasDecl(Backend, "FileReadStreamingData")) Backend.FileReadStreamingData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_read_streaming, "FileReadStreamingData") = .{},
+    linked_work: LinkedWorkData(.file_read_streaming) = .{},
+    route: RouteData(.file_read_streaming) = .none,
     handle: fs.fd_t,
     buffer: ReadBuf,
     /// Whether `handle` is pollable (non-seekable). `null` until classified by
-    /// the loop on first submission; backends with a readiness path use the
-    /// poll path when true and the thread pool when false. Callers may seed a
-    /// cached value to skip re-classification, and may read it back afterwards.
+    /// capability resolution on first submission; backends with a readiness
+    /// path use the poll path when true and the thread pool when false. Callers
+    /// may seed a cached value to skip re-classification, and may read it back
+    /// afterwards.
     pollable: ?bool = null,
 
     pub const Error = fs.FileReadError || Cancelable;
@@ -1248,16 +1331,16 @@ pub const FileReadStreaming = struct {
 pub const FileWriteStreaming = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.file_write_streaming) {
-        true => if (@hasDecl(Backend, "FileWriteStreamingData")) Backend.FileWriteStreamingData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_write_streaming, "FileWriteStreamingData") = .{},
+    linked_work: LinkedWorkData(.file_write_streaming) = .{},
+    route: RouteData(.file_write_streaming) = .none,
     handle: fs.fd_t,
     buffer: WriteBuf,
     /// Whether `handle` is pollable (non-seekable). `null` until classified by
-    /// the loop on first submission; backends with a readiness path use the
-    /// poll path when true and the thread pool when false. Callers may seed a
-    /// cached value to skip re-classification, and may read it back afterwards.
+    /// capability resolution on first submission; backends with a readiness
+    /// path use the poll path when true and the thread pool when false. Callers
+    /// may seed a cached value to skip re-classification, and may read it back
+    /// afterwards.
     pollable: ?bool = null,
 
     pub const Error = fs.FileWriteError || Cancelable;
@@ -1278,10 +1361,9 @@ pub const FileWriteStreaming = struct {
 pub const FileSync = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.file_sync) {
-        true => if (@hasDecl(Backend, "FileSyncData")) Backend.FileSyncData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_sync, "FileSyncData") = .{},
+    linked_work: LinkedWorkData(.file_sync) = .{},
+    route: RouteData(.file_sync) = .none,
     handle: fs.fd_t,
     flags: fs.FileSyncFlags,
 
@@ -1303,10 +1385,9 @@ pub const FileSync = struct {
 pub const FileSetSize = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.file_set_size) {
-        true => if (@hasDecl(Backend, "FileSetSizeData")) Backend.FileSetSizeData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_set_size, "FileSetSizeData") = .{},
+    linked_work: LinkedWorkData(.file_set_size) = .{},
+    route: RouteData(.file_set_size) = .none,
     handle: fs.fd_t,
     length: u64,
 
@@ -1328,10 +1409,9 @@ pub const FileSetSize = struct {
 pub const FileSetPermissions = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.file_set_permissions) {
-        true => if (@hasDecl(Backend, "FileSetPermissionsData")) Backend.FileSetPermissionsData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_set_permissions, "FileSetPermissionsData") = .{},
+    linked_work: LinkedWorkData(.file_set_permissions) = .{},
+    route: RouteData(.file_set_permissions) = .none,
     handle: fs.fd_t,
     mode: fs.mode_t,
 
@@ -1353,10 +1433,9 @@ pub const FileSetPermissions = struct {
 pub const FileSetOwner = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.file_set_owner) {
-        true => if (@hasDecl(Backend, "FileSetOwnerData")) Backend.FileSetOwnerData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_set_owner, "FileSetOwnerData") = .{},
+    linked_work: LinkedWorkData(.file_set_owner) = .{},
+    route: RouteData(.file_set_owner) = .none,
     handle: fs.fd_t,
     uid: ?fs.uid_t,
     gid: ?fs.gid_t,
@@ -1380,10 +1459,9 @@ pub const FileSetOwner = struct {
 pub const FileSetTimestamps = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.file_set_timestamps) {
-        true => if (@hasDecl(Backend, "FileSetTimestampsData")) Backend.FileSetTimestampsData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_set_timestamps, "FileSetTimestampsData") = .{},
+    linked_work: LinkedWorkData(.file_set_timestamps) = .{},
+    route: RouteData(.file_set_timestamps) = .none,
     handle: fs.fd_t,
     timestamps: fs.FileTimestamps,
 
@@ -1405,10 +1483,9 @@ pub const FileSetTimestamps = struct {
 pub const DirSetPermissions = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_set_permissions) {
-        true => if (@hasDecl(Backend, "DirSetPermissionsData")) Backend.DirSetPermissionsData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_set_permissions, "DirSetPermissionsData") = .{},
+    linked_work: LinkedWorkData(.dir_set_permissions) = .{},
+    route: RouteData(.dir_set_permissions) = .none,
     handle: fs.fd_t,
     mode: fs.mode_t,
 
@@ -1430,10 +1507,9 @@ pub const DirSetPermissions = struct {
 pub const DirSetOwner = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_set_owner) {
-        true => if (@hasDecl(Backend, "DirSetOwnerData")) Backend.DirSetOwnerData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_set_owner, "DirSetOwnerData") = .{},
+    linked_work: LinkedWorkData(.dir_set_owner) = .{},
+    route: RouteData(.dir_set_owner) = .none,
     handle: fs.fd_t,
     uid: ?fs.uid_t,
     gid: ?fs.gid_t,
@@ -1457,10 +1533,9 @@ pub const DirSetOwner = struct {
 pub const DirSetFilePermissions = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_set_file_permissions) {
-        true => if (@hasDecl(Backend, "DirSetFilePermissionsData")) Backend.DirSetFilePermissionsData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_set_file_permissions, "DirSetFilePermissionsData") = .{},
+    linked_work: LinkedWorkData(.dir_set_file_permissions) = .{},
+    route: RouteData(.dir_set_file_permissions) = .none,
     dir: fs.fd_t,
     path: []const u8,
     mode: fs.mode_t,
@@ -1486,10 +1561,9 @@ pub const DirSetFilePermissions = struct {
 pub const DirSetFileOwner = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_set_file_owner) {
-        true => if (@hasDecl(Backend, "DirSetFileOwnerData")) Backend.DirSetFileOwnerData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_set_file_owner, "DirSetFileOwnerData") = .{},
+    linked_work: LinkedWorkData(.dir_set_file_owner) = .{},
+    route: RouteData(.dir_set_file_owner) = .none,
     dir: fs.fd_t,
     path: []const u8,
     uid: ?fs.uid_t,
@@ -1517,10 +1591,9 @@ pub const DirSetFileOwner = struct {
 pub const DirSetFileTimestamps = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_set_file_timestamps) {
-        true => if (@hasDecl(Backend, "DirSetFileTimestampsData")) Backend.DirSetFileTimestampsData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_set_file_timestamps, "DirSetFileTimestampsData") = .{},
+    linked_work: LinkedWorkData(.dir_set_file_timestamps) = .{},
+    route: RouteData(.dir_set_file_timestamps) = .none,
     dir: fs.fd_t,
     path: []const u8,
     timestamps: fs.FileTimestamps,
@@ -1546,10 +1619,9 @@ pub const DirSetFileTimestamps = struct {
 pub const DirSymLink = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_sym_link) {
-        true => if (@hasDecl(Backend, "DirSymLinkData")) Backend.DirSymLinkData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_sym_link, "DirSymLinkData") = .{},
+    linked_work: LinkedWorkData(.dir_sym_link) = .{},
+    route: RouteData(.dir_sym_link) = .none,
     dir: fs.fd_t,
     target: []const u8,
     link_path: []const u8,
@@ -1575,10 +1647,9 @@ pub const DirSymLink = struct {
 pub const DirReadLink = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.dir_read_link) {
-        true => if (@hasDecl(Backend, "DirReadLinkData")) Backend.DirReadLinkData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_read_link, "DirReadLinkData") = .{},
+    linked_work: LinkedWorkData(.dir_read_link) = .{},
+    route: RouteData(.dir_read_link) = .none,
     dir: fs.fd_t,
     path: []const u8,
     buffer: []u8,
@@ -1602,10 +1673,9 @@ pub const DirReadLink = struct {
 pub const DirHardLink = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_hard_link) {
-        true => if (@hasDecl(Backend, "DirHardLinkData")) Backend.DirHardLinkData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_hard_link, "DirHardLinkData") = .{},
+    linked_work: LinkedWorkData(.dir_hard_link) = .{},
+    route: RouteData(.dir_hard_link) = .none,
     old_dir: fs.fd_t,
     old_path: []const u8,
     new_dir: fs.fd_t,
@@ -1633,10 +1703,9 @@ pub const DirHardLink = struct {
 pub const DirAccess = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_access) {
-        true => if (@hasDecl(Backend, "DirAccessData")) Backend.DirAccessData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_access, "DirAccessData") = .{},
+    linked_work: LinkedWorkData(.dir_access) = .{},
+    route: RouteData(.dir_access) = .none,
     dir: fs.fd_t,
     path: []const u8,
     flags: fs.AccessFlags,
@@ -1660,10 +1729,9 @@ pub const DirAccess = struct {
 pub const DirRealPath = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.dir_real_path) {
-        true => if (@hasDecl(Backend, "DirRealPathData")) Backend.DirRealPathData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_real_path, "DirRealPathData") = .{},
+    linked_work: LinkedWorkData(.dir_real_path) = .{},
+    route: RouteData(.dir_real_path) = .none,
     fd: fs.fd_t,
     buffer: []u8,
 
@@ -1685,10 +1753,9 @@ pub const DirRealPath = struct {
 pub const DirRealPathFile = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.dir_real_path_file) {
-        true => if (@hasDecl(Backend, "DirRealPathFileData")) Backend.DirRealPathFileData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_real_path_file, "DirRealPathFileData") = .{},
+    linked_work: LinkedWorkData(.dir_real_path_file) = .{},
+    route: RouteData(.dir_real_path_file) = .none,
     dir: fs.fd_t,
     path: []const u8,
     buffer: []u8,
@@ -1712,10 +1779,9 @@ pub const DirRealPathFile = struct {
 pub const FileRealPath = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.file_real_path) {
-        true => if (@hasDecl(Backend, "FileRealPathData")) Backend.FileRealPathData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_real_path, "FileRealPathData") = .{},
+    linked_work: LinkedWorkData(.file_real_path) = .{},
+    route: RouteData(.file_real_path) = .none,
     fd: fs.fd_t,
     buffer: []u8,
 
@@ -1737,10 +1803,9 @@ pub const FileRealPath = struct {
 pub const FileHardLink = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.file_hard_link) {
-        true => if (@hasDecl(Backend, "FileHardLinkData")) Backend.FileHardLinkData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_hard_link, "FileHardLinkData") = .{},
+    linked_work: LinkedWorkData(.file_hard_link) = .{},
+    route: RouteData(.file_hard_link) = .none,
     fd: fs.fd_t,
     new_dir: fs.fd_t,
     new_path: []const u8,
@@ -1766,10 +1831,9 @@ pub const FileHardLink = struct {
 pub const DirCreateDir = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_create_dir) {
-        true => if (@hasDecl(Backend, "DirCreateDirData")) Backend.DirCreateDirData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_create_dir, "DirCreateDirData") = .{},
+    linked_work: LinkedWorkData(.dir_create_dir) = .{},
+    route: RouteData(.dir_create_dir) = .none,
     dir: fs.fd_t,
     path: []const u8,
     mode: fs.mode_t,
@@ -1793,10 +1857,9 @@ pub const DirCreateDir = struct {
 pub const DirRename = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_rename) {
-        true => if (@hasDecl(Backend, "DirRenameData")) Backend.DirRenameData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_rename, "DirRenameData") = .{},
+    linked_work: LinkedWorkData(.dir_rename) = .{},
+    route: RouteData(.dir_rename) = .none,
     old_dir: fs.fd_t,
     old_path: []const u8,
     new_dir: fs.fd_t,
@@ -1822,10 +1885,9 @@ pub const DirRename = struct {
 pub const DirRenamePreserve = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_rename_preserve) {
-        true => if (@hasDecl(Backend, "DirRenamePreserveData")) Backend.DirRenamePreserveData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_rename_preserve, "DirRenamePreserveData") = .{},
+    linked_work: LinkedWorkData(.dir_rename_preserve) = .{},
+    route: RouteData(.dir_rename_preserve) = .none,
     old_dir: fs.fd_t,
     old_path: []const u8,
     new_dir: fs.fd_t,
@@ -1851,10 +1913,9 @@ pub const DirRenamePreserve = struct {
 pub const DirDeleteFile = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_delete_file) {
-        true => if (@hasDecl(Backend, "DirDeleteFileData")) Backend.DirDeleteFileData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_delete_file, "DirDeleteFileData") = .{},
+    linked_work: LinkedWorkData(.dir_delete_file) = .{},
+    route: RouteData(.dir_delete_file) = .none,
     dir: fs.fd_t,
     path: []const u8,
 
@@ -1876,10 +1937,9 @@ pub const DirDeleteFile = struct {
 pub const DirDeleteDir = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_delete_dir) {
-        true => if (@hasDecl(Backend, "DirDeleteDirData")) Backend.DirDeleteDirData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_delete_dir, "DirDeleteDirData") = .{},
+    linked_work: LinkedWorkData(.dir_delete_dir) = .{},
+    route: RouteData(.dir_delete_dir) = .none,
     dir: fs.fd_t,
     path: []const u8,
 
@@ -1901,10 +1961,9 @@ pub const DirDeleteDir = struct {
 pub const FileSize = struct {
     c: Completion,
     result_private_do_not_touch: u64 = undefined,
-    internal: switch (Backend.capabilities.file_size) {
-        true => if (@hasDecl(Backend, "FileSizeData")) Backend.FileSizeData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_size, "FileSizeData") = .{},
+    linked_work: LinkedWorkData(.file_size) = .{},
+    route: RouteData(.file_size) = .none,
     handle: fs.fd_t,
 
     pub const Error = fs.FileSizeError || Cancelable;
@@ -1924,10 +1983,9 @@ pub const FileSize = struct {
 pub const FileStat = struct {
     c: Completion,
     result_private_do_not_touch: fs.FileStatInfo = undefined,
-    internal: switch (Backend.capabilities.file_stat) {
-        true => if (@hasDecl(Backend, "FileStatData")) Backend.FileStatData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.file_stat, "FileStatData") = .{},
+    linked_work: LinkedWorkData(.file_stat) = .{},
+    route: RouteData(.file_stat) = .none,
     handle: fs.fd_t,
     path: ?[]const u8,
     flags: fs.FileStatFlags,
@@ -1954,10 +2012,9 @@ pub const FileStat = struct {
 pub const DirOpen = struct {
     c: Completion,
     result_private_do_not_touch: fs.fd_t = undefined,
-    internal: switch (Backend.capabilities.dir_open) {
-        true => if (@hasDecl(Backend, "DirOpenData")) Backend.DirOpenData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_open, "DirOpenData") = .{},
+    linked_work: LinkedWorkData(.dir_open) = .{},
+    route: RouteData(.dir_open) = .none,
     dir: fs.fd_t,
     path: []const u8,
     flags: fs.DirOpenFlags,
@@ -1981,10 +2038,9 @@ pub const DirOpen = struct {
 pub const DirClose = struct {
     c: Completion,
     result_private_do_not_touch: void = {},
-    internal: switch (Backend.capabilities.dir_close) {
-        true => if (@hasDecl(Backend, "DirCloseData")) Backend.DirCloseData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_close, "DirCloseData") = .{},
+    linked_work: LinkedWorkData(.dir_close) = .{},
+    route: RouteData(.dir_close) = .none,
     handle: fs.fd_t,
 
     pub const Error = Cancelable;
@@ -2004,10 +2060,9 @@ pub const DirClose = struct {
 pub const DirRead = struct {
     c: Completion,
     result_private_do_not_touch: usize = undefined,
-    internal: switch (Backend.capabilities.dir_read) {
-        true => if (@hasDecl(Backend, "DirReadData")) Backend.DirReadData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.dir_read, "DirReadData") = .{},
+    linked_work: LinkedWorkData(.dir_read) = .{},
+    route: RouteData(.dir_read) = .none,
     handle: fs.fd_t,
     buffer: []u8,
     restart: bool,
@@ -2121,7 +2176,9 @@ pub const PipeClose = struct {
 pub const DeviceIoControl = if (builtin.os.tag == .windows) struct {
     c: Completion,
     result_private_do_not_touch: std.os.windows.IO_STATUS_BLOCK = undefined,
-    internal: struct { work: Work = undefined, linked_context: Loop.LinkedWorkContext = undefined } = .{},
+    internal: BackendOpData(.device_io_control, "DeviceIoControlData") = .{},
+    linked_work: LinkedWorkData(.device_io_control) = .{},
+    route: RouteData(.device_io_control) = .none,
     handle: fs.fd_t,
     code: std.os.windows.CTL_CODE,
     in: []const u8,
@@ -2146,7 +2203,9 @@ pub const DeviceIoControl = if (builtin.os.tag == .windows) struct {
 } else struct {
     c: Completion,
     result_private_do_not_touch: i32 = undefined,
-    internal: struct { work: Work = undefined, linked_context: Loop.LinkedWorkContext = undefined } = .{},
+    internal: BackendOpData(.device_io_control, "DeviceIoControlData") = .{},
+    linked_work: LinkedWorkData(.device_io_control) = .{},
+    route: RouteData(.device_io_control) = .none,
     handle: fs.fd_t,
     code: u32,
     arg: ?*anyopaque,
@@ -2191,10 +2250,9 @@ pub const ProcessWait = struct {
     c: Completion,
     result_private_do_not_touch: ExitStatus = undefined,
     handle: ProcessHandle,
-    internal: switch (Backend.capabilities.process_wait) {
-        true => if (@hasDecl(Backend, "ProcessWaitData")) Backend.ProcessWaitData else struct {},
-        false => DelegatedWork,
-    } = .{},
+    internal: BackendOpData(.process_wait, "ProcessWaitData") = .{},
+    linked_work: LinkedWorkData(.process_wait) = .{},
+    route: RouteData(.process_wait) = .none,
 
     pub const ProcessHandle = switch (builtin.os.tag) {
         .windows => std.os.windows.HANDLE,

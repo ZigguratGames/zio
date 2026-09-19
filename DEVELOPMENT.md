@@ -16,7 +16,7 @@ Testing:
 - Use `./check.sh --full` to build all tests, but also build examples (at least once before creating a PR)
 
 Random notes on Zig usage:
-- We are using Zig 0.16+, so modules like `std.posix`, `std.Thread`, `std.fs`, `std.net` no longer exist or are mostly empty, look at `src/os/` for replacements.
+- This branch tracks Zig master (0.17 development), so modules like `std.posix`, `std.Thread`, `std.fs`, `std.net` no longer exist or are mostly empty, look at `src/os/` for replacements.
 - Use `zig env` to get the path to the Zig standard library and read the source code, if you need to check something.
 
 LLM usage:

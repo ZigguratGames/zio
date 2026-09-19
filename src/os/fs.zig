@@ -235,6 +235,11 @@ pub const FileWriteError = error{
     FileTooBig,
     LockViolation,
     Unseekable,
+    /// The device backing the file is busy.
+    DeviceBusy,
+    /// The file is an executable image that is currently being executed, or is
+    /// otherwise in use by the kernel.
+    FileBusy,
     Canceled,
     Unexpected,
 };
@@ -252,6 +257,15 @@ pub const FileSyncError = error{
     InputOutput,
     NoSpaceLeft,
     DiskQuota,
+    AccessDenied,
+    Canceled,
+    Unexpected,
+};
+
+pub const FileSeekError = error{
+    /// The file does not have a position that can be set: a pipe, FIFO, socket
+    /// or tty, or an offset the device cannot represent.
+    Unseekable,
     AccessDenied,
     Canceled,
     Unexpected,
@@ -287,6 +301,7 @@ pub const DirDeleteFileError = error{
     IsDir,
     SymLinkLoop,
     NameTooLong,
+    BadPathName,
     NotDir,
     SystemResources,
     ReadOnlyFileSystem,
@@ -300,6 +315,7 @@ pub const DirDeleteDirError = error{
     FileNotFound,
     SymLinkLoop,
     NameTooLong,
+    BadPathName,
     NotDir,
     SystemResources,
     ReadOnlyFileSystem,
@@ -316,6 +332,7 @@ pub const DirCreateDirError = error{
     SymLinkLoop,
     LinkQuotaExceeded,
     NameTooLong,
+    BadPathName,
     FileNotFound,
     SystemResources,
     NoSpaceLeft,
@@ -560,6 +577,7 @@ pub const FileStatError = error{
     InvalidFileDescriptor,
     FileNotFound,
     NameTooLong,
+    BadPathName,
     NotDir,
     SymLinkLoop,
     SystemResources,
@@ -652,6 +670,7 @@ pub fn openat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: 
             return switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
                 .ACCESS_DENIED => error.AccessDenied,
                 else => |err| return unexpectedError(err),
             };
@@ -751,7 +770,7 @@ pub fn openat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags: 
             else => |err| {
                 if (flags.resolve_beneath) {
                     if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
-                    if (builtin.os.tag.isDarwin() and @intFromEnum(err) == 107) return error.AccessDenied;
+                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
                 }
                 return errnoToFileOpenError(err, flags);
             },
@@ -788,6 +807,7 @@ pub fn dirOpen(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags:
             return switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
                 .ACCESS_DENIED => error.AccessDenied,
                 else => |err| return unexpectedError(err),
             };
@@ -863,7 +883,7 @@ pub fn dirOpen(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags:
             else => |err| {
                 if (flags.resolve_beneath) {
                     if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
-                    if (builtin.os.tag.isDarwin() and @intFromEnum(err) == 107) return error.AccessDenied;
+                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
                 }
                 return errnoToDirOpenError(err, flags);
             },
@@ -916,6 +936,7 @@ pub fn createat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags
             return switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
                 .ACCESS_DENIED => error.AccessDenied,
                 .ALREADY_EXISTS => error.PathAlreadyExists,
                 .FILE_EXISTS => error.PathAlreadyExists,
@@ -1008,7 +1029,7 @@ pub fn createat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags
             else => |err| {
                 if (flags.resolve_beneath) {
                     if (@hasField(@TypeOf(err), "NOTCAPABLE") and err == .NOTCAPABLE) return error.AccessDenied;
-                    if (builtin.os.tag.isDarwin() and @intFromEnum(err) == 107) return error.AccessDenied;
+                    if (builtin.os.tag.isDarwin() and @backingInt(err) == 107) return error.AccessDenied;
                 }
                 return errnoToFileOpenError(err, flags);
             },
@@ -1394,6 +1415,51 @@ pub fn fileSync(fd: fd_t, flags: FileSyncFlags) FileSyncError!void {
     }
 }
 
+/// Move the file position by `offset` bytes, relative to the current position.
+pub fn fileSeekBy(fd: fd_t, offset: i64) FileSeekError!void {
+    if (builtin.os.tag == .windows) {
+        return seekWindows(fd, offset, w.FILE_CURRENT);
+    }
+    return seekPosix(fd, offset, posix.system.SEEK.CUR);
+}
+
+/// Set the file position to `offset` bytes from the start of the file.
+pub fn fileSeekTo(fd: fd_t, offset: u64) FileSeekError!void {
+    // Both `LARGE_INTEGER` and `off_t` are signed, so an offset past 2^63 has
+    // no representation to seek to.
+    const signed = std.math.cast(i64, offset) orelse return error.Unseekable;
+    if (builtin.os.tag == .windows) {
+        return seekWindows(fd, signed, w.FILE_BEGIN);
+    }
+    return seekPosix(fd, signed, posix.system.SEEK.SET);
+}
+
+fn seekWindows(handle: fd_t, offset: i64, move_method: w.DWORD) FileSeekError!void {
+    if (w.SetFilePointerEx(handle, offset, null, move_method) == w.FALSE) {
+        return errnoToFileSeekError(w.GetLastError());
+    }
+}
+
+fn seekPosix(fd: fd_t, offset: i64, whence: u32) FileSeekError!void {
+    // `off_t` is narrower than 64 bits on some platforms; an offset that does
+    // not fit is one the file cannot be positioned at.
+    const off = std.math.cast(posix.off_t, offset) orelse return error.Unseekable;
+
+    const sc = try syscall_cancel.Syscall.begin();
+    defer sc.finish();
+    while (true) {
+        const rc = posix.sys.lseek(fd, off, whence, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => {
+                try sc.checkCancel();
+                continue;
+            },
+            else => |err| return errnoToFileSeekError(err),
+        }
+    }
+}
+
 /// Rename a file using renameat() syscall
 pub fn renameat(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8) DirRenameError!void {
     if (builtin.os.tag == .windows) {
@@ -1412,6 +1478,7 @@ pub fn renameat(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u
             switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => return error.FileNotFound,
                 .PATH_NOT_FOUND => return error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => return error.BadPathName,
                 .ACCESS_DENIED => return error.AccessDenied,
                 .ALREADY_EXISTS => return error.Unexpected,
                 .SHARING_VIOLATION => return error.FileBusy,
@@ -1463,6 +1530,7 @@ pub fn renameatPreserve(allocator: std.mem.Allocator, old_dir: fd_t, old_path: [
             switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => return error.FileNotFound,
                 .PATH_NOT_FOUND => return error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => return error.BadPathName,
                 .ACCESS_DENIED => return error.AccessDenied,
                 .ALREADY_EXISTS, .FILE_EXISTS => return error.PathAlreadyExists,
                 .SHARING_VIOLATION => return error.FileBusy,
@@ -1485,6 +1553,11 @@ pub fn renameatPreserve(allocator: std.mem.Allocator, old_dir: fd_t, old_path: [
                 .SUCCESS => return,
                 .INTR => continue,
                 .EXIST => return error.PathAlreadyExists,
+                // RENAME_NOREPLACE needs per-filesystem support: EINVAL when
+                // the filesystem lacks it (out-of-tree ZFS; in-tree filesystems
+                // added it between 3.15 and 4.9), ENOSYS when renameat2 itself
+                // is absent (pre-3.15). Fall back to hardlink+delete.
+                .INVAL, .NOSYS => break,
                 else => |err| return errnoToDirRenameError(err),
             }
         }
@@ -1505,10 +1578,99 @@ pub fn renameatPreserve(allocator: std.mem.Allocator, old_dir: fd_t, old_path: [
         }
     }
 
-    // Fallback for other POSIX and Darwin filesystems that don't support renameatx_np(RENAME_EXCL):
-    // hardlink + delete
+    // Atomic no-replace rename unavailable on this platform/filesystem.
+    return renameatPreserveFallback(allocator, old_dir, old_path, new_dir, new_path);
+}
+
+/// No-replace rename via hardlink + delete for filesystems that reject the
+/// atomic renameat2(RENAME_NOREPLACE)/renameatx_np(RENAME_EXCL). The hardlink
+/// returns EEXIST -> error.PathAlreadyExists when the destination exists.
+/// Regular files only (a directory source fails the hardlink with EPERM).
+/// All-or-nothing: if the source cannot be deleted after linking, the link is
+/// removed again and the error is returned.
+fn renameatPreserveFallback(allocator: std.mem.Allocator, old_dir: fd_t, old_path: []const u8, new_dir: fd_t, new_path: []const u8) DirRenamePreserveError!void {
     try dirHardLink(allocator, old_dir, old_path, new_dir, new_path, .{});
-    dirDeleteFile(allocator, old_dir, old_path) catch {};
+    dirDeleteFile(allocator, old_dir, old_path) catch |err| switch (err) {
+        // The source vanished after the link was made, so the rename is
+        // complete; rolling back would delete the only name left for the data.
+        error.FileNotFound => {},
+        else => {
+            // Only undo the link while the source is verifiably still in
+            // place; if we can't confirm that, the new link may be the only
+            // name left for the data, so keep it.
+            if (dirAccess(allocator, old_dir, old_path, .{ .follow_symlinks = false })) |_| {
+                dirDeleteFile(allocator, new_dir, new_path) catch {};
+            } else |_| {}
+            return err;
+        },
+    };
+}
+
+test renameatPreserveFallback {
+    // The fallback is unreachable on Windows (renameatPreserve uses MoveFileExW).
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const at_cwd = posix.AT.FDCWD;
+    const src = "zio_rnpf_src.tmp";
+    const dst = "zio_rnpf_dst.tmp";
+
+    dirDeleteFile(allocator, at_cwd, src) catch {};
+    dirDeleteFile(allocator, at_cwd, dst) catch {};
+    defer dirDeleteFile(allocator, at_cwd, src) catch {};
+    defer dirDeleteFile(allocator, at_cwd, dst) catch {};
+
+    // Free destination: source moves onto it.
+    try close(try createat(allocator, at_cwd, src, .{}));
+    try renameatPreserveFallback(allocator, at_cwd, src, at_cwd, dst);
+    try std.testing.expectError(error.FileNotFound, dirAccess(allocator, at_cwd, src, .{}));
+    try dirAccess(allocator, at_cwd, dst, .{});
+
+    // Occupied destination: fails and leaves the source in place.
+    try close(try createat(allocator, at_cwd, src, .{}));
+    try std.testing.expectError(error.PathAlreadyExists, renameatPreserveFallback(allocator, at_cwd, src, at_cwd, dst));
+    try dirAccess(allocator, at_cwd, src, .{});
+}
+
+test "renameatPreserveFallback: rollback when source cannot be deleted" {
+    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // Root bypasses the directory permission check the test relies on.
+    if (posix.system.geteuid() == 0) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+    const at_cwd = posix.AT.FDCWD;
+    const src_dir_path = "zio_rnpf_rollback_dir.tmp";
+    const src = "src";
+    const dst = "zio_rnpf_rollback_dst.tmp";
+
+    dirDeleteFile(allocator, at_cwd, dst) catch {};
+    defer dirDeleteFile(allocator, at_cwd, dst) catch {};
+
+    try mkdirat(allocator, at_cwd, src_dir_path, 0o755);
+    defer {
+        dirSetFilePermissions(allocator, at_cwd, src_dir_path, 0o755, .{}) catch {};
+        dirDeleteFile(allocator, at_cwd, src_dir_path ++ "/" ++ src) catch {};
+        dirDeleteDir(allocator, at_cwd, src_dir_path) catch {};
+    }
+
+    const src_dir = try dirOpen(allocator, at_cwd, src_dir_path, .{});
+    defer posix.close(src_dir);
+
+    try close(try createat(allocator, src_dir, src, .{}));
+
+    // Make the source directory read-only so the post-link unlink fails.
+    try dirSetFilePermissions(allocator, at_cwd, src_dir_path, 0o555, .{});
+
+    if (renameatPreserveFallback(allocator, src_dir, src, at_cwd, dst)) |_| {
+        return error.TestUnexpectedResult;
+    } else |err| switch (err) {
+        error.AccessDenied, error.PermissionDenied => {},
+        else => return err,
+    }
+
+    // Nothing changed: source still present, destination link rolled back.
+    try dirAccess(allocator, src_dir, src, .{});
+    try std.testing.expectError(error.FileNotFound, dirAccess(allocator, at_cwd, dst, .{}));
 }
 
 /// Delete a file using unlinkat() syscall
@@ -1521,6 +1683,7 @@ pub fn dirDeleteFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) 
             return switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
                 .ACCESS_DENIED => blk: {
                     // DeleteFileW returns ACCESS_DENIED when the path is a
                     // directory.  Check with GetFileAttributesW so the caller
@@ -1592,6 +1755,7 @@ pub fn dirDeleteDir(allocator: std.mem.Allocator, dir: fd_t, path: []const u8) D
             return switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
                 .ACCESS_DENIED => error.AccessDenied,
                 .SHARING_VIOLATION => error.FileBusy,
                 .DIR_NOT_EMPTY => error.DirNotEmpty,
@@ -1629,6 +1793,7 @@ pub fn mkdirat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, mode: 
             return switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
                 .ACCESS_DENIED => error.AccessDenied,
                 .ALREADY_EXISTS => error.PathAlreadyExists,
                 .FILE_EXISTS => error.PathAlreadyExists,
@@ -1733,8 +1898,10 @@ pub fn errnoToFileReadError(err: E) FileReadError {
                 .PIPE => error.BrokenPipe,
                 .NOMEM => error.SystemResources,
                 .BADF => error.NotOpenForReading,
-                .SPIPE => error.Unseekable,
-                .NXIO => error.Unseekable,
+                // ESPIPE is the usual "not seekable" answer for a positional
+                // read, but macOS returns ENXIO for a tty, and EOVERFLOW when
+                // the offset is past what the device can represent.
+                .SPIPE, .NXIO, .OVERFLOW => error.Unseekable,
                 else => |e| unexpectedError(e),
             };
         },
@@ -1770,8 +1937,12 @@ pub fn errnoToFileWriteError(err: E) FileWriteError {
                 .BADF => error.NotOpenForWriting,
                 .DQUOT => error.DiskQuota,
                 .FBIG => error.FileTooBig,
-                .SPIPE => error.Unseekable,
-                .NXIO => error.Unseekable,
+                .BUSY => error.DeviceBusy,
+                .TXTBSY => error.FileBusy,
+                // ESPIPE is the usual "not seekable" answer for a positional
+                // write, but macOS returns ENXIO for a tty, and EOVERFLOW when
+                // the offset is past what the device can represent.
+                .SPIPE, .NXIO, .OVERFLOW => error.Unseekable,
                 else => |e| unexpectedError(e),
             };
         },
@@ -1806,6 +1977,48 @@ pub fn errnoToFileSyncError(errno: posix.system.E) FileSyncError {
         .CANCELED => error.Canceled,
         else => |e| unexpectedError(e),
     };
+}
+
+pub fn errnoToFileSeekError(err: E) FileSeekError {
+    switch (builtin.os.tag) {
+        .windows => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                // The answers for "this handle has no file position". Windows
+                // reports a pipe as INVALID_PARAMETER and Wine reports one as
+                // BAD_DEV_TYPE; INVALID_FUNCTION is the documented answer for a
+                // handle type that cannot seek, and SEEK_ON_DEVICE for a
+                // character device. The move method is a constant and the
+                // distance is range checked before the call, so the handle is
+                // the only parameter left for INVALID_PARAMETER to be about.
+                // NEGATIVE_SEEK is a position before the start of the file.
+                .INVALID_FUNCTION,
+                .INVALID_PARAMETER,
+                .BAD_DEV_TYPE,
+                .SEEK_ON_DEVICE,
+                .NEGATIVE_SEEK,
+                => error.Unseekable,
+                .ACCESS_DENIED => error.AccessDenied,
+                .OPERATION_ABORTED => error.Canceled,
+                else => |e| unexpectedError(e),
+            };
+        },
+        else => {
+            return switch (err) {
+                .SUCCESS => unreachable,
+                .CANCELED => error.Canceled,
+                // ESPIPE is the usual "not seekable" answer, but macOS returns
+                // ENXIO for a tty, and EOVERFLOW when the resulting offset is
+                // past what the device can represent. EINVAL is a resulting
+                // offset before the start of the file.
+                .SPIPE, .NXIO, .OVERFLOW, .INVAL => error.Unseekable,
+                // Not specified by POSIX for lseek, but sandboxes that filter
+                // the syscall report a denied seek this way.
+                .ACCES, .PERM => error.AccessDenied,
+                else => |e| unexpectedError(e),
+            };
+        },
+    }
 }
 
 pub fn errnoToDirRenameError(errno: posix.system.E) DirRenameError {
@@ -2040,6 +2253,7 @@ pub fn fstatat(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, flags:
             return switch (w.GetLastError()) {
                 .FILE_NOT_FOUND => error.FileNotFound,
                 .PATH_NOT_FOUND => error.FileNotFound,
+                .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
                 .ACCESS_DENIED => error.AccessDenied,
                 else => |err| return unexpectedError(err),
             };
@@ -2812,7 +3026,7 @@ fn dirAccessWindows(allocator: std.mem.Allocator, dir: fd_t, path: []const u8, f
     switch (w.GetLastError()) {
         .FILE_NOT_FOUND, .PATH_NOT_FOUND => return error.FileNotFound,
         .ACCESS_DENIED => return error.AccessDenied,
-        .INVALID_NAME => return error.BadPathName,
+        .INVALID_NAME, .BAD_PATHNAME => return error.BadPathName,
         else => return error.Unexpected,
     }
 }
@@ -2831,7 +3045,7 @@ pub fn dirRead(handle: fd_t, buffer: []u8, restart: bool) DirReadError!usize {
 fn dirReadPosix(handle: fd_t, buffer: []u8, restart: bool) DirReadError!usize {
     // Seek to beginning if restart requested
     if (restart) {
-        const rc = posix.sys.lseek(handle, 0, posix.system.SEEK.SET);
+        const rc = posix.sys.lseek(handle, 0, posix.system.SEEK.SET, null);
         switch (posix.errno(rc)) {
             .SUCCESS => {},
             .BADF => return error.Unexpected,
@@ -2853,8 +3067,10 @@ fn dirReadPosix(handle: fd_t, buffer: []u8, restart: bool) DirReadError!usize {
             // the old dirent layout (32-bit d_fileno), which does not match the
             // modern std.c.dirent we parse with. getdents(2) (__getdents30) returns
             // the modern layout, matching std's own directory iteration.
-            .netbsd => posix.system.getdents(handle, buffer.ptr, buffer.len),
-            .freebsd, .openbsd, .dragonfly => blk: {
+            // OpenBSD removed the getdirentries(2) libc wrapper; getdents(2) is
+            // the only interface and returns the modern dirent layout std parses.
+            .netbsd, .openbsd => posix.system.getdents(handle, buffer.ptr, buffer.len),
+            .freebsd, .dragonfly => blk: {
                 var basep: c_long = 0;
                 break :blk posix.system.getdirentries(handle, buffer.ptr, buffer.len, &basep);
             },
@@ -3010,8 +3226,9 @@ pub fn dirRealPath(fd: fd_t, buffer: []u8) DirRealPathError!usize {
             }
         }
     } else {
-        // Other BSDs: not supported
-        return error.Unexpected;
+        // OpenBSD and other BSDs have no way to recover a path from an fd
+        // (no /proc, no F_GETPATH, no F_KINFO), so realPath by fd is unsupported.
+        return error.OperationUnsupported;
     }
 }
 
@@ -3031,7 +3248,7 @@ pub fn dirRealPathFile(allocator: std.mem.Allocator, dir: fd_t, path: []const u8
             if (std.c.realpath(path_z, buffer.ptr)) |_| {
                 return std.mem.indexOfScalar(u8, buffer, 0) orelse buffer.len;
             }
-            const err: posix.system.E = @enumFromInt(std.c._errno().*);
+            const err: posix.system.E = @fromBackingInt(@intCast(std.c._errno().*));
             if (err == .INTR) continue;
             return errnoToDirRealPathFileError(err);
         }
@@ -3171,6 +3388,7 @@ fn dirRealPathFileWindows(allocator: std.mem.Allocator, dir: fd_t, path: []const
         return switch (w.GetLastError()) {
             .FILE_NOT_FOUND, .PATH_NOT_FOUND => error.FileNotFound,
             .ACCESS_DENIED => error.AccessDenied,
+            .INVALID_NAME, .BAD_PATHNAME => error.BadPathName,
             .NOT_ENOUGH_MEMORY => error.SystemResources,
             else => error.Unexpected,
         };
@@ -3178,6 +3396,89 @@ fn dirRealPathFileWindows(allocator: std.mem.Allocator, dir: fd_t, path: []const
     defer _ = w.CloseHandle(handle);
 
     return dirRealPathWindows(handle, buffer);
+}
+
+/// Returns true if `fd` refers to a terminal.
+pub fn isTty(fd: fd_t) bool {
+    if (builtin.os.tag == .windows) {
+        // A console handle is one the console driver will report a mode for.
+        var mode: w.DWORD = undefined;
+        if (w.GetConsoleMode(fd, &mode) != w.FALSE) return true;
+        return isCygwinPty(fd);
+    }
+
+    if (builtin.os.tag == .linux) {
+        // Asking a descriptor for its window size is a question only a terminal
+        // answers, and unlike `isatty` it does not need libc. The answer itself
+        // is four u16 we do not read.
+        var wsz: [4]u16 = undefined;
+        return ioctlPosix(fd, @intCast(posix.system.T.IOCGWINSZ), &wsz) >= 0;
+    }
+
+    // Everywhere else libc is linked and `isatty` is the canonical answer. The
+    // window size ioctl is not a stand-in for it there: a pty master on macOS
+    // rejects the ioctl, and which devices answer it is a per-system detail we
+    // would rather not carry.
+    return posix.system.isatty(fd) != 0;
+}
+
+/// Returns true if ANSI escape codes written to `fd` will be interpreted.
+pub fn supportsAnsiEscapeCodes(fd: fd_t) bool {
+    if (builtin.os.tag == .windows) {
+        var mode: w.DWORD = undefined;
+        if (w.GetConsoleMode(fd, &mode) != w.FALSE) {
+            // A console that already has the mode set needs nothing further.
+            // One that does not can still have it turned on, which is what
+            // `enableAnsiEscapeCodes` is for, so it counts as supporting them.
+            return true;
+        }
+        return isCygwinPty(fd);
+    }
+
+    return isTty(fd);
+}
+
+/// An MSYS2/Cygwin pty is a named pipe rather than a console, named
+/// `msys-[...]-ptyN-[...]` or `cygwin-[...]-ptyN-[...]`.
+fn isCygwinPty(handle: fd_t) bool {
+    if (builtin.os.tag != .windows) return false;
+
+    // Checking the device type first keeps the more expensive name query off
+    // every handle that is not a pipe at all.
+    var iosb: w.IO_STATUS_BLOCK = undefined;
+    var device_info: w.FILE_FS_DEVICE_INFORMATION = undefined;
+    if (w.NtQueryVolumeInformationFile(
+        handle,
+        &iosb,
+        &device_info,
+        @sizeOf(w.FILE_FS_DEVICE_INFORMATION),
+        .FileFsDeviceInformation,
+    ) != .SUCCESS) return false;
+    if (device_info.DeviceType != w.FILE_DEVICE_NAMED_PIPE) return false;
+
+    // The names we are looking for are far shorter than a full path, so a
+    // buffer that cannot hold every possible name is enough; anything that does
+    // not fit is not one of ours.
+    const name_offset = @offsetOf(w.FILE_NAME_INFORMATION, "FileName");
+    var name_bytes: [name_offset + 256 * 2]u8 align(@alignOf(w.FILE_NAME_INFORMATION)) = @splat(0);
+    if (w.NtQueryInformationFile(
+        handle,
+        &iosb,
+        &name_bytes,
+        @intCast(name_bytes.len),
+        .FileNameInformation,
+    ) != .SUCCESS) return false;
+
+    const name_info: *const w.FILE_NAME_INFORMATION = @ptrCast(&name_bytes);
+    const len = @min(name_info.FileNameLength, name_bytes.len - name_offset);
+    const name = std.mem.bytesAsSlice(u16, name_bytes[name_offset..][0..len]);
+
+    // The queried name is prefixed with a '\', e.g. \msys-1888ae32e00d56aa-pty0-to-master
+    const msys = std.unicode.utf8ToUtf16LeStringLiteral("\\msys-");
+    const cygwin = std.unicode.utf8ToUtf16LeStringLiteral("\\cygwin-");
+    const pty = std.unicode.utf8ToUtf16LeStringLiteral("-pty");
+    return (std.mem.startsWith(u16, name, msys) or std.mem.startsWith(u16, name, cygwin)) and
+        std.mem.indexOf(u16, name, pty) != null;
 }
 
 /// Call ioctl(2) on `fd`, retrying on EINTR. Returns the raw ioctl return
@@ -3194,7 +3495,7 @@ fn ioctlPosix(fd: fd_t, code: u32, arg: ?*anyopaque) i32 {
             else
                 rc,
             .INTR => continue,
-            else => |err| return -@as(i32, @intFromEnum(err)),
+            else => |err| return -@as(i32, @backingInt(err)),
         }
     }
 }

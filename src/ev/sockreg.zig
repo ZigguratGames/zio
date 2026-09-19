@@ -35,6 +35,7 @@ const NetRecvFrom = @import("completion.zig").NetRecvFrom;
 const NetSendTo = @import("completion.zig").NetSendTo;
 const NetRecvMsg = @import("completion.zig").NetRecvMsg;
 const NetSendMsg = @import("completion.zig").NetSendMsg;
+const NetSendFile = @import("completion.zig").NetSendFile;
 const NetPoll = @import("completion.zig").NetPoll;
 const Queue = @import("queue.zig").Queue;
 const log = @import("../common.zig").log;
@@ -166,6 +167,7 @@ pub fn isSocketOp(op: Op) bool {
         .net_sendto,
         .net_recvmsg,
         .net_sendmsg,
+        .net_send_file,
         .net_poll,
         => true,
         else => false,
@@ -176,7 +178,7 @@ pub fn isSocketOp(op: Op) bool {
 pub fn dirForOp(c: *Completion) Dir {
     return switch (c.op) {
         .net_accept, .net_recv, .net_recvfrom, .net_recvmsg => .read,
-        .net_connect, .net_send, .net_sendto, .net_sendmsg => .write,
+        .net_connect, .net_send, .net_sendto, .net_sendmsg, .net_send_file => .write,
         .net_poll => switch (c.cast(NetPoll).event) {
             .recv => .read,
             .send => .write,
@@ -196,6 +198,7 @@ pub fn netHandle(c: *Completion) net.fd_t {
         .net_sendto => c.cast(NetSendTo).handle,
         .net_recvmsg => c.cast(NetRecvMsg).handle,
         .net_sendmsg => c.cast(NetSendMsg).handle,
+        .net_send_file => c.cast(NetSendFile).handle,
         .net_poll => c.cast(NetPoll).handle,
         else => std.debug.panic("zio sockreg: netHandle on non-socket op {s}", .{@tagName(c.op)}),
     };
@@ -251,9 +254,9 @@ pub fn park(self: anytype, state: anytype, fd: net.fd_t, completion: *Completion
     // timer, and cancel routing are unchanged. The owner loop only holds the
     // poller registration and services the op in place when its edge fires,
     // completing it cross-thread through the synchronized completion machinery.
-    // Accounting is group-shared (is_multi_threaded), so it balances regardless of
-    // which loop finishes the op (the owner on a readiness edge, or the submitter
-    // on cancel/timeout).
+    // Accounting balances regardless of which loop finishes the op (the owner on
+    // a readiness edge, or the submitter on cancel/timeout): the active decrement
+    // is routed to `completion.loop` and the inflight storage is group-shared.
     completion.prev = null;
     completion.next = null;
     entry.waiters(dir).push(completion);
@@ -278,7 +281,7 @@ pub fn service(self: anytype, state: anytype, fd: net.fd_t, dir: Dir, event: any
     var iter: ?*Completion = entry.waiters(dir).head;
     while (iter) |c| {
         iter = c.next;
-        if (c.state == .completed or c.state == .dead) {
+        if (c.loadState().phase != .running) {
             _ = entry.waiters(dir).remove(c);
             continue;
         }
@@ -313,7 +316,7 @@ pub fn service(self: anytype, state: anytype, fd: net.fd_t, dir: Dir, event: any
 /// The shard lock makes that answer exact rather than advisory: `service` runs
 /// the syscall and sets the result while holding the same lock it removes the
 /// waiter under, so "still in the queue" and "no result set yet" are the same
-/// condition. The reverse - inferring it from `cancel_state.completed` - would
+/// condition. The reverse - inferring it from the `.completed` phase - would
 /// race, because `service` deliberately marks the op completed only after
 /// dropping the lock.
 pub fn detach(self: anytype, target: *Completion) bool {
@@ -323,8 +326,8 @@ pub fn detach(self: anytype, target: *Completion) bool {
     shard.mutex.lock();
     defer shard.mutex.unlock();
     // A live parked op always has an entry: detach only runs while the op is not
-    // yet completed (loop.cancel and cancelLocal both bail on cancel_state
-    // .completed), and an entry is only dropped by `unregister` on close, which
+    // yet completed (loop.cancel and cancelLocal both bail on the `.completed`
+    // phase), and an entry is only dropped by `unregister` on close, which
     // cannot happen until the op completes and wakes its owner. So this branch is
     // unreachable in practice. Return false anyway (not true): a missing entry
     // could only mean the waiter was already removed - i.e. `service` is finishing
@@ -398,7 +401,7 @@ pub fn submitConnect(self: anytype, state: anytype, c: *Completion) void {
         .retry => {
             // The socket became writable while we raced: the connect finished.
             if (net.getSockError(data.handle)) |se| {
-                if (se == 0) c.setResult(.net_connect, {}) else c.setError(net.errnoToConnectError(@enumFromInt(se)));
+                if (se == 0) c.setResult(.net_connect, {}) else c.setError(net.errnoToConnectError(@fromBackingInt(@intCast(se))));
             } else |_| c.setError(error.Unexpected);
             state.markCompletedFromBackend(c);
         },

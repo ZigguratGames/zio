@@ -9,9 +9,8 @@ const syscall_cancel = @import("../os/syscall_cancel.zig");
 const dns = @import("root.zig");
 
 /// Fills `storage` with canonical name (if requested) and addresses from
-/// a `getaddrinfo` linked list. Returns the number of entries written, or
-/// `error.TooManyAddresses` if the resolver returned more addresses than
-/// `storage` can hold (the buffer is fully populated in that case).
+/// a `getaddrinfo` linked list. Returns the number of entries written.
+/// Addresses beyond `storage.len` are dropped without error.
 pub fn fillResultsFromAddrinfo(
     storage: []dns.LookupResult,
     options: dns.LookupOptions,
@@ -24,10 +23,13 @@ pub fn fillResultsFromAddrinfo(
             if (h.canonname) |name_ptr| {
                 if (i >= storage.len) return i;
                 const name_slice = std.mem.sliceTo(name_ptr, 0);
-                @memcpy(cname_buf[0..name_slice.len], name_slice);
-                cname_buf[name_slice.len] = 0;
-                storage[i] = .{ .canonical_name = .{ .bytes = cname_buf[0..name_slice.len] } };
-                i += 1;
+                // A resolver that answers with a name too long to be encodable
+                // has told us nothing usable; drop it rather than truncate.
+                if (name_slice.len <= cname_buf.len) {
+                    @memcpy(cname_buf[0..name_slice.len], name_slice);
+                    storage[i] = .{ .canonical_name = .{ .bytes = cname_buf[0..name_slice.len] } };
+                    i += 1;
+                }
             }
         }
     }
@@ -36,7 +38,7 @@ pub fn fillResultsFromAddrinfo(
     while (current) |info| : (current = @ptrCast(info.next)) {
         const addr = info.addr orelse continue;
         if (addr.family != os_net.AF.INET and addr.family != os_net.AF.INET6) continue;
-        if (i >= storage.len) return error.TooManyAddresses;
+        if (i >= storage.len) break;
         storage[i] = .{ .address = dns.IpAddress.initPosix(@ptrCast(addr), @intCast(info.addrlen)) };
         i += 1;
     }

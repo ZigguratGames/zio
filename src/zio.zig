@@ -23,8 +23,11 @@ pub const RandomSecureError = @import("random.zig").RandomSecureError;
 pub const beginShield = runtime.beginShield;
 pub const endShield = runtime.endShield;
 pub const checkCancel = runtime.checkCancel;
+pub const recancel = runtime.recancel;
 
 pub const AutoCancel = @import("autocancel.zig").AutoCancel;
+pub const withTimeout = @import("autocancel.zig").withTimeout;
+pub const WithTimeoutResult = @import("autocancel.zig").WithTimeoutResult;
 
 pub const Group = @import("group.zig").Group;
 pub const CompletionQueue = @import("completion_queue.zig").CompletionQueue;
@@ -34,17 +37,27 @@ pub const TaskLocal = @import("task.zig").TaskLocal;
 const common = @import("common.zig");
 pub const Cancelable = common.Cancelable;
 pub const Timeoutable = common.Timeoutable;
+pub const Closeable = common.Closeable;
 pub const blockInPlace = common.blockInPlace;
 
 pub const time = @import("time.zig"); // TODO: make non-pub
 pub const Duration = time.Duration;
 pub const Timestamp = time.Timestamp;
 pub const Timeout = time.Timeout;
+pub const Clock = time.Clock;
 pub const Stopwatch = time.Stopwatch;
 
 const fs = @import("fs.zig");
 pub const File = fs.File;
 pub const Dir = fs.Dir;
+pub const AtomicFile = fs.AtomicFile;
+pub const TempFile = fs.TempFile;
+pub const TempDir = fs.TempDir;
+pub const openSystemTempDir = fs.openSystemTempDir;
+pub const createTempFile = fs.createTempFile;
+pub const createTempDir = fs.createTempDir;
+pub const max_temp_prefix_len = fs.max_temp_prefix_len;
+pub const max_temp_name_len = fs.max_temp_name_len;
 pub const PipePair = fs.PipePair;
 
 pub const stdin = fs.stdin;
@@ -56,7 +69,6 @@ pub const net = @import("net.zig");
 pub const Mutex = @import("sync/Mutex.zig");
 pub const Condition = @import("sync/Condition.zig");
 pub const ResetEvent = @import("sync/ResetEvent.zig");
-pub const Notify = @import("sync/Notify.zig");
 pub const RwLock = @import("sync/RwLock.zig");
 pub const Semaphore = @import("sync/Semaphore.zig");
 pub const Barrier = @import("sync/Barrier.zig");
@@ -89,5 +101,6 @@ test {
     _ = @import("io.zig");
     _ = @import("random.zig");
     _ = @import("task.zig");
+    _ = @import("stderr.zig");
     _ = @import("os/syscall_cancel.zig");
 }

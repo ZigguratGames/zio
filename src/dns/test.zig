@@ -24,7 +24,8 @@ test "HostName: validate" {
     try HostName.validate("::1");
     try HostName.validate("2001:db8::1");
     try HostName.validate(@as([63]u8, @splat('a')) ++ ".com"); // Label exactly 63 chars (valid)
-    try HostName.validate(@as([127 * 2]u8, @bitCast(@as([127][2]u8, @splat(.{ 'a', '.' })))) ++ "a"); // Total length 255 (valid)
+    try HostName.validate(@as([126 * 2]u8, @bitCast(@as([126][2]u8, @splat(.{ 'a', '.' })))) ++ "a"); // 253 chars, the longest encodable bare name (valid)
+    try HostName.validate(@as([126 * 2]u8, @bitCast(@as([126][2]u8, @splat(.{ 'a', '.' })))) ++ "a."); // 254 chars, the same name with the root dot (valid)
 
     // Invalid hostnames
     try std.testing.expectError(error.InvalidHostName, HostName.validate(""));
@@ -38,7 +39,9 @@ test "HostName: validate" {
     try std.testing.expectError(error.InvalidHostName, HostName.validate("."));
     try std.testing.expectError(error.InvalidHostName, HostName.validate(".."));
     try std.testing.expectError(error.InvalidHostName, HostName.validate(@as([64]u8, @splat('a')) ++ ".com")); // Label length 64 (too long)
-    try std.testing.expectError(error.NameTooLong, HostName.validate(@as([127 * 2]u8, @bitCast(@as([127][2]u8, @splat(.{ 'a', '.' })))) ++ "ab")); // Total length 256 (too long)
+    try std.testing.expectError(error.NameTooLong, HostName.validate(@as([126 * 2]u8, @bitCast(@as([126][2]u8, @splat(.{ 'a', '.' })))) ++ "aa")); // 254 chars bare: one octet too long on the wire
+    try std.testing.expectError(error.NameTooLong, HostName.validate(@as([127 * 2]u8, @bitCast(@as([127][2]u8, @splat(.{ 'a', '.' })))) ++ "a")); // 255 chars bare (too long)
+    try std.testing.expectError(error.NameTooLong, HostName.validate(@as([127 * 2]u8, @bitCast(@as([127][2]u8, @splat(.{ 'a', '.' })))) ++ "a.")); // 255 chars plus the root dot (too long)
 }
 
 test "HostName: eql" {
@@ -176,7 +179,7 @@ test "HostName: lookup with no storage" {
 
     const host = try HostName.init("localhost");
     var storage: [0]HostName.LookupResult = undefined;
-    try std.testing.expectError(error.TooManyAddresses, host.lookup(&storage, .{ .port = 80 }));
+    try std.testing.expectEqual(0, try host.lookup(&storage, .{ .port = 80 }));
 }
 
 test "HostName: lookup localhost" {
@@ -224,7 +227,7 @@ test "HostName: lookup numeric IPv4 with no storage" {
 
     const host = try HostName.init("127.0.0.1");
     var storage: [0]HostName.LookupResult = undefined;
-    try std.testing.expectError(error.TooManyAddresses, host.lookup(&storage, .{ .port = 8080 }));
+    try std.testing.expectEqual(0, try host.lookup(&storage, .{ .port = 8080 }));
 }
 
 test "HostName: lookup numeric IPv6 with no storage" {
@@ -233,7 +236,7 @@ test "HostName: lookup numeric IPv6 with no storage" {
 
     const host = try HostName.init("::1");
     var storage: [0]HostName.LookupResult = undefined;
-    try std.testing.expectError(error.TooManyAddresses, host.lookup(&storage, .{ .port = 8080 }));
+    try std.testing.expectEqual(0, try host.lookup(&storage, .{ .port = 8080 }));
 }
 
 test "HostName: lookup numeric IPv4 wrong family" {

@@ -228,12 +228,12 @@ pub const Domain = enum(c_int) {
 
     /// Convert from POSIX address family constant
     pub fn fromPosix(af: anytype) Domain {
-        return @enumFromInt(af);
+        return @fromBackingInt(@intCast(af));
     }
 
     /// Convert to POSIX address family constant
     pub fn toPosix(self: Domain) c_int {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 };
 
@@ -247,12 +247,12 @@ pub const Type = enum(c_int) {
 
     /// Convert from POSIX socket type constant
     pub fn fromPosix(sock_type: anytype) Type {
-        return @enumFromInt(sock_type);
+        return @fromBackingInt(@intCast(sock_type));
     }
 
     /// Convert to POSIX socket type constant
     pub fn toPosix(self: Type) c_int {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Convert from std.Io socket mode
@@ -279,17 +279,17 @@ pub const Protocol = enum(c_int) {
 
     /// Convert from POSIX protocol constant
     pub fn fromPosix(protocol: anytype) Protocol {
-        return @enumFromInt(protocol);
+        return @fromBackingInt(@intCast(protocol));
     }
 
     /// Convert to POSIX protocol constant
     pub fn toPosix(self: Protocol) c_int {
-        return @intFromEnum(self);
+        return @backingInt(self);
     }
 
     /// Convert from std.Io protocol
     pub fn fromStd(protocol: std.Io.net.Protocol) Protocol {
-        return @enumFromInt(@intFromEnum(protocol));
+        return @fromBackingInt(@intCast(@backingInt(protocol)));
     }
 };
 
@@ -409,7 +409,7 @@ pub fn socketpair(domain: Domain, socket_type: Type, protocol: Protocol, flags: 
                 const err = posix.errno(rc);
                 // Darwin with __DARWIN_UNIX03 returns EOPNOTSUPP = 102, but Zig's
                 // darwin E enum defines OPNOTSUPP = 45 (the legacy ENOTSUP alias).
-                if (builtin.os.tag.isDarwin() and @intFromEnum(err) == 102) {
+                if (builtin.os.tag.isDarwin() and @backingInt(err) == 102) {
                     return error.OperationUnsupported;
                 }
                 switch (err) {
@@ -461,6 +461,7 @@ pub const BindError = error{
     NetworkDown,
     InputOutput,
     SystemResources,
+    Canceled,
     Unexpected,
 };
 
@@ -475,6 +476,7 @@ pub fn errnoToBindError(err: E) BindError {
                 .ENOTSOCK => error.FileDescriptorNotASocket,
                 .ENETDOWN => error.NetworkDown,
                 .ENOBUFS => error.SystemResources,
+                .OPERATION_ABORTED => error.Canceled,
                 else => unexpectedError(err),
             };
         },
@@ -495,6 +497,7 @@ pub fn errnoToBindError(err: E) BindError {
                 .ROFS => error.ReadOnlyFileSystem,
                 .IO => error.InputOutput,
                 .NETDOWN => error.NetworkDown,
+                .CANCELED => error.Canceled, // io_uring completion after cancel
                 else => |e| unexpectedError(e),
             };
         },
@@ -530,6 +533,7 @@ pub const ListenError = error{
     FileDescriptorNotASocket,
     NetworkDown,
     SystemResources,
+    Canceled,
     Unexpected,
 };
 
@@ -543,6 +547,7 @@ pub fn errnoToListenError(err: E) ListenError {
                 .ENOTSOCK => error.FileDescriptorNotASocket,
                 .ENETDOWN => error.NetworkDown,
                 .ENOBUFS, .EMFILE => error.SystemResources,
+                .OPERATION_ABORTED => error.Canceled,
                 else => unexpectedError(err),
             };
         },
@@ -553,6 +558,7 @@ pub fn errnoToListenError(err: E) ListenError {
                 .OPNOTSUPP => error.OperationNotSupported,
                 .NOTSOCK => error.FileDescriptorNotASocket,
                 .NETDOWN => error.NetworkDown,
+                .CANCELED => error.Canceled, // io_uring completion after cancel
                 else => |e| unexpectedError(e),
             };
         },
@@ -629,7 +635,6 @@ pub fn connect(fd: fd_t, addr: *const sockaddr, addr_len: socklen_t) ConnectErro
 pub const AcceptError = error{
     WouldBlock,
     ConnectionAborted,
-    ConnectionResetByPeer,
     ProcessFdQuotaExceeded,
     SystemFdQuotaExceeded,
     SystemResources,
@@ -810,6 +815,7 @@ pub fn errnoToConnectError(err: E) ConnectError {
                 .CONNRESET => error.ConnectionResetByPeer,
                 .TIMEDOUT => error.Timeout,
                 .HOSTUNREACH, .NETUNREACH => error.NetworkUnreachable,
+                .NETDOWN => error.NetworkDown,
                 .ACCES, .PERM => error.AccessDenied,
                 .ADDRINUSE => error.AddressInUse,
                 .ADDRNOTAVAIL => error.AddressUnavailable,
@@ -829,13 +835,14 @@ pub fn errnoToConnectError(err: E) ConnectError {
     }
 }
 
+// Winsock reports "the queued connection went away before we took it" as
+// ECONNRESET, POSIX as ECONNABORTED; both collapse into ConnectionAborted.
 pub fn errnoToAcceptError(err: E) AcceptError {
     switch (builtin.os.tag) {
         .windows => {
             return switch (err) {
                 .EWOULDBLOCK => error.WouldBlock,
-                .ECONNABORTED => error.ConnectionAborted,
-                .ECONNRESET => error.ConnectionResetByPeer,
+                .ECONNABORTED, .ECONNRESET => error.ConnectionAborted,
                 .EMFILE => error.ProcessFdQuotaExceeded,
                 .ENOBUFS => error.SystemResources,
                 .ENOTSOCK => error.FileDescriptorNotASocket,
@@ -851,8 +858,7 @@ pub fn errnoToAcceptError(err: E) AcceptError {
             return switch (err) {
                 .SUCCESS => unreachable,
                 .AGAIN => error.WouldBlock,
-                .CONNABORTED => error.ConnectionAborted,
-                .CONNRESET => error.ConnectionResetByPeer,
+                .CONNABORTED, .CONNRESET => error.ConnectionAborted,
                 .MFILE => error.ProcessFdQuotaExceeded,
                 .NFILE => error.SystemFdQuotaExceeded,
                 .NOMEM, .NOBUFS => error.SystemResources,
@@ -883,6 +889,7 @@ pub fn errnoToRecvError(err: E) RecvError {
                 .ESHUTDOWN => error.SocketShutdown,
                 .EOPNOTSUPP => error.OperationNotSupported,
                 .ENETDOWN => error.NetworkDown,
+                .EHOSTUNREACH, .ENETUNREACH => error.NetworkUnreachable,
                 .EMSGSIZE => error.MessageOversize,
                 .ENOBUFS => error.SystemResources,
                 .OPERATION_ABORTED => error.Canceled,
@@ -899,6 +906,7 @@ pub fn errnoToRecvError(err: E) RecvError {
                 .NOTCONN => error.SocketNotConnected,
                 .NOTSOCK => error.FileDescriptorNotASocket,
                 .NETDOWN => error.NetworkDown,
+                .HOSTUNREACH, .HOSTDOWN, .NETUNREACH => error.NetworkUnreachable,
                 .NOBUFS, .NOMEM => error.SystemResources,
                 .MSGSIZE => error.MessageOversize,
                 // recvmsg with SCM_RIGHTS passes fds from the sender; if the
@@ -927,7 +935,8 @@ pub fn errnoToSendError(err: E) SendError {
                 .ENOTSOCK => error.FileDescriptorNotASocket,
                 .EMSGSIZE => error.MessageTooBig,
                 .ESHUTDOWN => error.BrokenPipe,
-                .EHOSTUNREACH, .ENETDOWN => error.NetworkUnreachable,
+                .ENETDOWN => error.NetworkDown,
+                .EHOSTUNREACH, .ENETUNREACH => error.NetworkUnreachable,
                 .EOPNOTSUPP => error.OperationNotSupported,
                 .ENOBUFS => error.SystemResources,
                 .OPERATION_ABORTED => error.Canceled,
@@ -940,12 +949,15 @@ pub fn errnoToSendError(err: E) SendError {
                 .AGAIN => error.WouldBlock,
                 .ACCES => error.AccessDenied,
                 .CONNRESET => error.ConnectionResetByPeer,
+                .CONNABORTED => error.ConnectionAborted,
                 .TIMEDOUT => error.ConnectionTimedOut,
                 .NOTCONN => error.SocketNotConnected,
                 .NOTSOCK => error.FileDescriptorNotASocket,
                 .MSGSIZE => error.MessageTooBig,
+                .OPNOTSUPP => error.OperationNotSupported,
                 .PIPE => error.BrokenPipe,
-                .HOSTUNREACH, .HOSTDOWN, .NETDOWN => error.NetworkUnreachable,
+                .HOSTUNREACH, .HOSTDOWN, .NETUNREACH => error.NetworkUnreachable,
+                .NETDOWN => error.NetworkDown,
                 .NOBUFS => error.SystemResources,
                 .CANCELED => error.Canceled,
                 else => |e| unexpectedError(e),
@@ -1045,6 +1057,7 @@ pub const RecvError = error{
     SocketShutdown,
     OperationNotSupported,
     NetworkDown,
+    NetworkUnreachable,
     SystemResources,
     MessageOversize,
     ProcessFdQuotaExceeded,
@@ -1514,13 +1527,15 @@ pub fn createLoopbackSocketPair() CreateLoopbackSocketPairError![2]fd_t {
     errdefer close(listen_sock);
 
     // Bind to 127.0.0.1:0 (any available port)
-    var bind_addr: sockaddr = @bitCast(posix.system.sockaddr.in{
+    // 0.17 std's windows sockaddr no longer @bitCasts from sockaddr.in;
+    // pass the concrete type through a pointer cast instead.
+    const bind_addr_in = posix.system.sockaddr.in{
         .family = AF.INET,
         .port = 0, // Let OS choose port
         .addr = 0x0100007F, // 127.0.0.1 in network byte order (little-endian)
         .zero = @splat(0),
-    });
-    try bind(listen_sock, &bind_addr, @sizeOf(posix.system.sockaddr.in));
+    };
+    try bind(listen_sock, @ptrCast(&bind_addr_in), @sizeOf(posix.system.sockaddr.in));
 
     // Listen for connections
     try listen(listen_sock, 1);
@@ -1587,7 +1602,7 @@ pub fn getaddrinfo(
         },
         else => {
             const rc = std.c.getaddrinfo(node, service, hints, res);
-            const rc_int: c_int = @intFromEnum(rc);
+            const rc_int: c_int = @backingInt(rc);
             if (rc_int != 0) {
                 return errnoToGetAddrInfoError(rc);
             }
@@ -1609,7 +1624,7 @@ pub fn freeaddrinfo(res: *addrinfo) void {
 fn errnoToGetAddrInfoError(err: anytype) GetAddrInfoError {
     switch (builtin.os.tag) {
         .windows => {
-            const wsa_err: windows.WinsockError = @enumFromInt(@as(u16, @intCast(err)));
+            const wsa_err: windows.WinsockError = @fromBackingInt(@intCast(@as(u16, @intCast(err))));
             return switch (wsa_err) {
                 .EAFNOSUPPORT => error.AddressFamilyUnsupported,
                 .EINVAL => error.InvalidFlags,
@@ -1638,7 +1653,7 @@ fn errnoToGetAddrInfoError(err: anytype) GetAddrInfoError {
                 .SOCKTYPE => error.SocketTypeNotSupported,
                 .SYSTEM => {
                     // EAI.SYSTEM means we need to check errno
-                    const errno_val: posix.system.E = @enumFromInt(std.c._errno().*);
+                    const errno_val: posix.system.E = @fromBackingInt(@intCast(std.c._errno().*));
                     return switch (errno_val) {
                         .SUCCESS => unreachable,
                         .NOMEM => error.SystemResources,

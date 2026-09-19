@@ -49,8 +49,9 @@ const Runtime = @import("../runtime.zig").Runtime;
 const os = @import("../os/root.zig");
 const yield = @import("../runtime.zig").yield;
 const Group = @import("../group.zig").Group;
-const Cancelable = @import("../common.zig").Cancelable;
-const Timeoutable = @import("../common.zig").Timeoutable;
+const common = @import("../common.zig");
+const Cancelable = common.Cancelable;
+const Timeoutable = common.Timeoutable;
 const Timeout = @import("../time.zig").Timeout;
 const WaitQueue = @import("../utils/wait_queue.zig").WaitQueue;
 const WaitNode = @import("../utils/wait_queue.zig").WaitNode;
@@ -162,21 +163,25 @@ pub fn timedWait(self: *ResetEvent, timeout: Timeout) (Timeoutable || Cancelable
     }
 
     // Wait for signal or timeout, handling spurious wakeups internally
-    waiter.timedWait(1, timeout, .allow_cancel) catch |err| {
-        // On cancellation, try to remove from queue
-        const was_in_queue = self.wait_queue.remove(&waiter.node);
-        if (!was_in_queue) {
-            // Removed by set() - wait for signal to complete before destroying waiter
+    waiter.timedWait(1, timeout, .allow_cancel) catch |err| switch (err) {
+        // The timer fired, but set() may have claimed this waiter just behind
+        // it: whoever can still remove the node decides.
+        error.Timeout => {
+            if (self.wait_queue.remove(&waiter.node)) return error.Timeout;
+            // Claimed by set() - take the signal instead of the timeout, and
+            // wait for it to land before destroying the waiter.
             waiter.wait(1, .no_cancel);
-        }
-        return err;
+        },
+        error.Canceled => {
+            // On cancellation, try to remove from queue
+            const was_in_queue = self.wait_queue.remove(&waiter.node);
+            if (!was_in_queue) {
+                // Removed by set() - wait for signal to complete before destroying waiter
+                waiter.wait(1, .no_cancel);
+            }
+            return err;
+        },
     };
-
-    // Determine winner: can we remove ourselves from queue?
-    if (self.wait_queue.remove(&waiter.node)) {
-        // We were still in queue - timer won
-        return error.Timeout;
-    }
 
     // Acquire fence: synchronize-with set()'s .release in setFlag
     // Ensures visibility of all writes made before set() was called
@@ -199,12 +204,11 @@ pub fn getResult(self: *const ResetEvent) void {
     return;
 }
 
-/// Registers a waiter to be notified when the event is set.
+/// Registers a waiter to be notified when the event is set, or claims the
+/// select if it already is.
 /// This is part of the Future protocol for select().
-/// Returns false if the event is already set (no wait needed), true if added to queue.
-pub fn asyncWait(self: *ResetEvent, waiter: *Waiter) bool {
-    // Try to push to queue - only succeeds if event is not set (flag not set)
-    return self.wait_queue.pushUnlessFlag(&waiter.node);
+pub fn asyncWait(self: *ResetEvent, waiter: *Waiter) common.AsyncWaitState {
+    return common.waitOnFlagQueue(&self.wait_queue, waiter);
 }
 
 /// Cancels a pending wait operation by removing the waiter.
@@ -475,4 +479,43 @@ test "ResetEvent: async task signals foreign thread" {
 
     try std.testing.expect(thread_done.load(.acquire));
     try std.testing.expect(reset_event.isSet());
+}
+
+test "ResetEvent: a set that races the commit fence is not lost" {
+    // The select's sweep holds the commit fence for another arm when set()
+    // pops this arm and signals it. That signal cannot claim the winner word,
+    // and a re-poll afterwards cannot recover it either, because reset() has
+    // since cleared the flag. The bounced arm must be recorded instead.
+    const NO_WINNER = common.NO_WINNER;
+
+    var event = ResetEvent.init;
+
+    var parent = Waiter.init();
+    var winner: std.atomic.Value(usize) = .init(NO_WINNER);
+    var gen: std.atomic.Value(u32) = .init(0);
+    var pending: std.atomic.Value(usize) = .init(NO_WINNER);
+    var waiter = Waiter.initSelect(&parent, &winner, &gen, &pending, 3);
+
+    // .requeued on a first call: a flag-queue source cannot tell a first
+    // registration from one whose predecessor was popped and signaled, so the
+    // select resolves it (see the protocol comment in select.zig).
+    try std.testing.expectEqual(.requeued, event.asyncWait(&waiter));
+
+    // Owner's sweep is committing a different arm.
+    winner.store(common.COMMITTING, .seq_cst);
+    event.set();
+
+    // set() popped every waiter, so reset() is legal here.
+    winner.store(NO_WINNER, .seq_cst);
+    event.reset();
+
+    // Re-polling cannot see it: the flag is clear again. (.requeued, not
+    // .queued: the source knows its earlier registration was signaled, which
+    // is what keeps the settle accounting balanced.)
+    try std.testing.expectEqual(.requeued, event.asyncWait(&waiter));
+
+    // The arm's identity survived, so the select still reports it.
+    try std.testing.expectEqual(3, pending.load(.acquire));
+    try std.testing.expect(Waiter.promotePending(&winner, &pending));
+    try std.testing.expectEqual(3, winner.load(.acquire));
 }

@@ -34,9 +34,9 @@ test "ev.ThreadPool: one task" {
 
     loop.add(&work.c);
 
-    try loop.run(.until_done);
+    try loop.run();
 
-    try std.testing.expectEqual(.dead, work.c.state);
+    try std.testing.expectEqual(.dead, work.c.loadState().phase);
     try std.testing.expectEqual(1, test_fn.called);
 }
 

@@ -73,7 +73,20 @@ pub const HostName = struct {
     /// Externally managed memory. Already checked to be valid.
     bytes: []const u8,
 
-    pub const max_len = 255;
+    /// Size of a buffer that holds any host name, canonical names included.
+    /// Taken from the standard library so the `canonical_name_buffer` types in
+    /// `LookupOptions` stay identical to `std.Io.net.HostName`'s and cannot
+    /// drift apart as Zig changes the value (see #725). It is always at least
+    /// `max_encodable_len`, and on Zig 0.16 one byte more.
+    pub const max_len = std.Io.net.HostName.max_len;
+
+    /// The longest host name the DNS wire format can carry, in text form. A
+    /// name is capped at 255 octets on the wire, where every label carries a
+    /// one-octet length prefix and the root label is a single zero octet
+    /// (RFC 1035, Section 3.1). That leaves 254 characters with the trailing
+    /// dot standing in for the root label, or 253 without it.
+    const max_encodable_len = 254;
+    const max_encodable_len_without_root = max_encodable_len - 1;
 
     pub const ValidateError = error{
         NameTooLong,
@@ -86,13 +99,17 @@ pub const HostName = struct {
         if (IpAddress.parseIp(bytes, 0)) |_| return else |_| {}
         if (bytes[0] == '.') return error.InvalidHostName;
 
-        // Ignore trailing dot (FQDN). It doesn't count toward our length.
+        // Ignore the trailing dot of an FQDN when measuring and validating
+        // labels. In a packet it is the zero-length root label, so it costs an
+        // octet either way and the limit below already accounts for it.
         const end = if (bytes[bytes.len - 1] == '.') end: {
             if (bytes.len == 1) return error.InvalidHostName;
             break :end bytes.len - 1;
         } else bytes.len;
 
-        if (end > max_len) return error.NameTooLong;
+        // Measured without the trailing dot, so that a name is judged by what
+        // it costs on the wire rather than by how it happens to be spelled.
+        if (end > max_encodable_len_without_root) return error.NameTooLong;
 
         // Hostnames are divided into dot-separated "labels", which:
         // - Start with a letter or digit
@@ -151,7 +168,8 @@ pub const HostName = struct {
 
     /// Resolves the hostname to IP addresses.
     /// Fills `storage` with up to `storage.len` results.
-    /// Returns the number of entries written.
+    /// Returns the number of entries written. Addresses that do not fit are
+    /// dropped without error — a full buffer may mean the answer was truncated.
     pub fn lookup(
         self: HostName,
         storage: []LookupResult,
@@ -168,10 +186,7 @@ pub const HostName = struct {
     /// Resolves the hostname and connects to the first successful address.
     pub fn connect(self: HostName, port: u16, options: IpAddress.ConnectOptions) !Stream {
         var storage: [32]LookupResult = undefined;
-        const count = self.lookup(&storage, .{ .port = port }) catch |err| switch (err) {
-            error.TooManyAddresses => storage.len,
-            else => return err,
-        };
+        const count = try self.lookup(&storage, .{ .port = port });
 
         var last_err: ?anyerror = null;
         for (storage[0..count]) |entry| {
@@ -612,10 +627,12 @@ pub const IpAddress = extern union {
     pub const ListenOptions = struct {
         kernel_backlog: u31 = default_kernel_backlog,
         reuse_address: bool = false,
+        reuse_port: bool = false,
     };
 
     pub const BindOptions = struct {
         reuse_address: bool = false,
+        reuse_port: bool = false,
     };
 
     pub const ConnectOptions = struct {
@@ -627,7 +644,10 @@ pub const IpAddress = extern union {
         errdefer socket.close();
 
         if (options.reuse_address) {
-            try socket.setReuse(true);
+            try socket.setReuseAddress(true);
+        }
+        if (options.reuse_port) {
+            try socket.setReusePort(true);
         }
 
         try socket.bind(.{ .ip = self });
@@ -640,7 +660,10 @@ pub const IpAddress = extern union {
         errdefer socket.close();
 
         if (options.reuse_address) {
-            try socket.setReuse(true);
+            try socket.setReuseAddress(true);
+        }
+        if (options.reuse_port) {
+            try socket.setReusePort(true);
         }
 
         try socket.bind(.{ .ip = self });
@@ -717,7 +740,7 @@ pub const UnixAddress = extern union {
         errdefer socket.close();
 
         if (options.reuse_address) {
-            try socket.setReuse(true);
+            try socket.setReuseAddress(true);
         }
 
         try socket.bind(.{ .unix = self });
@@ -904,18 +927,6 @@ pub const Socket = struct {
             return error.Unsupported;
         }
         try self.setBoolOption(os.posix.SOL.SOCKET, os.posix.SO.REUSEPORT, enabled);
-    }
-
-    /// Set SO_REUSEADDR only — deliberate divergence from upstream, which
-    /// also sets SO_REUSEPORT here (and std.Io documents `reuse_address` as
-    /// both on POSIX). REUSEPORT lets an unrelated process silently bind an
-    /// already-served TCP port, after which the kernel splits accepted
-    /// connections between the listeners — a debugging disaster that no
-    /// server intends by "reuse address". Here address reuse means fast
-    /// rebinding through TIME_WAIT only, never sharing a live listener.
-    /// Every bind/listen path (native and std.Io) funnels through this.
-    pub fn setReuse(self: Socket, enabled: bool) !void {
-        try self.setReuseAddress(enabled);
     }
 
     /// Enable or disable TCP keepalive (SO_KEEPALIVE)
@@ -1126,14 +1137,27 @@ pub const Server = struct {
         timeout: Timeout = .none,
     };
 
+    /// Accepts the next incoming connection.
+    ///
+    /// `ConnectionAborted` is not reported: it means a connection sitting in the
+    /// accept queue went away before we got to it, which says nothing about the
+    /// listener, so the next connection is taken instead. The timeout covers the
+    /// whole call, not each attempt, so a stream of aborted connections cannot
+    /// extend it.
     pub fn accept(self: Server, options: AcceptOptions) !Stream {
-        var peer_addr: Address = undefined;
-        var peer_addr_len: os.net.socklen_t = @sizeOf(Address);
+        const deadline = options.timeout.toDeadline();
+        while (true) {
+            var peer_addr: Address = undefined;
+            var peer_addr_len: os.net.socklen_t = @sizeOf(Address);
 
-        var op = ev.NetAccept.init(self.socket.handle, &peer_addr.any, &peer_addr_len);
-        try timedWaitForIo(&op.c, options.timeout);
-        const handle = try op.getResult();
-        return .{ .socket = .{ .handle = handle, .address = .fromPosix(&peer_addr.any, peer_addr_len) } };
+            var op = ev.NetAccept.init(self.socket.handle, &peer_addr.any, &peer_addr_len);
+            try timedWaitForIo(&op.c, deadline);
+            const handle = op.getResult() catch |err| switch (err) {
+                error.ConnectionAborted => continue,
+                else => |e| return e,
+            };
+            return .{ .socket = .{ .handle = handle, .address = .fromPosix(&peer_addr.any, peer_addr_len) } };
+        }
     }
 
     pub fn shutdown(self: Server, how: ShutdownHow) !void {
@@ -1220,7 +1244,7 @@ pub const Stream = struct {
         }
 
         pub fn fromStd(stream: std.Io.net.Stream, io: std.Io, buffer: []u8) Reader {
-            _ = Runtime.fromIo(io);
+            std.debug.assert(Runtime.fromIo(io) != null); // adopting the handle needs a zio-backed std.Io
             return init(stdIoHandleToZio(stream.socket.handle), buffer);
         }
 
@@ -1281,7 +1305,7 @@ pub const Stream = struct {
         }
 
         pub fn fromStd(stream: std.Io.net.Stream, io: std.Io, buffer: []u8) Writer {
-            _ = Runtime.fromIo(io);
+            std.debug.assert(Runtime.fromIo(io) != null); // adopting the handle needs a zio-backed std.Io
             return init(stdIoHandleToZio(stream.socket.handle), buffer);
         }
 
@@ -1336,7 +1360,7 @@ pub const Stream = struct {
             if (bufs[0].len == 0 and bufs[1].len == 0) return error.Unimplemented;
 
             // Stream the file body directly from the current read position.
-            const want = @intFromEnum(limit);
+            const want = @backingInt(limit);
             if (want == 0) return 0;
 
             var op = ev.NetSendFile.init(
@@ -1667,6 +1691,107 @@ test "Stream.Writer.sendFile honors a byte limit" {
             // Only `limit` file bytes are sent, even though the file is larger.
             const sent = try writer.interface.sendFileAll(&fr, .limited(limit));
             try std.testing.expectEqual(@as(usize, limit), sent);
+            try writer.interface.flush();
+
+            stream.shutdown(.both) catch {};
+        }
+    };
+
+    var server_port_buf: [1]u16 = undefined;
+    var server_port_ch = Channel(u16).init(&server_port_buf);
+
+    var group: Group = .init;
+    defer group.cancel();
+
+    try group.spawn(ServerTask.run, .{&server_port_ch});
+    try group.spawn(ClientTask.run, .{ io, &server_port_ch });
+
+    try group.wait();
+}
+
+test "Stream.Writer.sendFile completes a transfer that stalls on a full socket buffer" {
+    const Io = std.Io;
+    const path = "test-native-sendfile-stall";
+    // With both socket buffers shrunk below, this comfortably overruns the
+    // in-flight window, so the sender must hit WouldBlock and wait for the
+    // receiver at least once instead of completing inline.
+    const total = 1024 * 1024;
+
+    const runtime = try Runtime.init(std.testing.allocator, .{ .thread_pool = .{} });
+    defer runtime.deinit();
+    const io = runtime.io();
+
+    const ServerTask = struct {
+        fn run(server_port: *Channel(u16)) !void {
+            const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+            const server = try addr.listen(.{});
+            defer server.close();
+
+            // Keep the receive window small (the accepted socket inherits it,
+            // and it is set before the client connects) so the file doesn't
+            // have to be huge to fill it.
+            try server.socket.setReceiveBufferSize(16 * 1024);
+
+            try server_port.send(server.socket.address.ip.getPort());
+
+            var stream = try server.accept(.{});
+            defer stream.close();
+
+            var received: usize = 0;
+            var next_stall: usize = 0;
+            var buf: [4096]u8 = undefined;
+            while (received < total) {
+                // Stall periodically (including before the first read) so the
+                // sender repeatedly fills the socket buffers, parks on the
+                // write edge, and resumes, rather than going through a single
+                // park/resume cycle.
+                if (received >= next_stall) {
+                    try runtime_mod.sleep(.fromMilliseconds(50));
+                    next_stall += 128 * 1024;
+                }
+                const n = stream.read(&buf, .none) catch break;
+                if (n == 0) break;
+                for (buf[0..n], received..) |b, i| {
+                    try std.testing.expectEqual(@as(u8, @intCast(i % 251)), b);
+                }
+                received += n;
+            }
+            try std.testing.expectEqual(total, received);
+        }
+    };
+
+    const ClientTask = struct {
+        fn run(client_io: Io, server_port: *Channel(u16)) !void {
+            // Create the source file with a known pattern.
+            {
+                var f = try Io.Dir.cwd().createFile(client_io, path, .{ .truncate = true });
+                defer f.close(client_io);
+                var fw_buf: [4096]u8 = undefined;
+                var fw = f.writer(client_io, &fw_buf);
+                var i: usize = 0;
+                while (i < total) : (i += 1) {
+                    try fw.interface.writeByte(@intCast(i % 251));
+                }
+                try fw.interface.flush();
+            }
+            defer Io.Dir.cwd().deleteFile(client_io, path) catch {};
+
+            var f = try Io.Dir.cwd().openFile(client_io, path, .{});
+            defer f.close(client_io);
+            var fr_buf: [4096]u8 = undefined;
+            var fr = f.reader(client_io, &fr_buf);
+
+            const port = try server_port.receive();
+            const addr = try IpAddress.parseIp4("127.0.0.1", port);
+            var stream = try tcpConnectToAddress(addr, .{});
+            defer stream.close();
+            try stream.socket.setSendBufferSize(16 * 1024);
+
+            var write_buffer: [4096]u8 = undefined;
+            var writer = stream.writer(&write_buffer);
+
+            const sent = try writer.interface.sendFileAll(&fr, .unlimited);
+            try std.testing.expectEqual(total, sent);
             try writer.interface.flush();
 
             stream.shutdown(.both) catch {};
@@ -2285,6 +2410,29 @@ test "IpAddress: listen/accept/connect/read/write IPv4" {
     try checkListen(addr, IpAddress.ListenOptions{}, &write_buffer);
 }
 
+test "IpAddress: reuse_address does not enable duplicate listeners" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const first_addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    const first = try first_addr.listen(.{});
+    defer first.close();
+
+    const second_addr = try IpAddress.parseIp4("127.0.0.1", first.socket.address.ip.getPort());
+    try std.testing.expectError(error.AddressInUse, second_addr.listen(.{ .reuse_address = true }));
+}
+
+test "IpAddress: reuse_port allows duplicate listeners" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
+    const first_addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    const first = try first_addr.listen(.{ .reuse_port = true });
+    defer first.close();
+
+    const second_addr = try IpAddress.parseIp4("127.0.0.1", first.socket.address.ip.getPort());
+    const second = try second_addr.listen(.{ .reuse_port = true });
+    defer second.close();
+}
+
 test "IpAddress: listen/accept/connect/read/write IPv6" {
     var write_buffer: [32]u8 = undefined;
     const addr = try IpAddress.parseIp6("::1", 0);
@@ -2409,6 +2557,69 @@ test "Server: accept timeout" {
 
     const result = server.accept(.{ .timeout = Timeout.fromMilliseconds(10) });
     try std.testing.expectError(error.Timeout, result);
+}
+
+test "Server: accept deadline timeout" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    const server = try addr.listen(.{});
+    defer server.close();
+
+    const deadline = Timeout.fromMilliseconds(10).toDeadline();
+    const result = server.accept(.{ .timeout = deadline });
+    try std.testing.expectError(error.Timeout, result);
+}
+
+test "Server: accept never reports ConnectionAborted" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    const server = try addr.listen(.{});
+    defer server.close();
+
+    // Call it first so the inferred error set is resolved by the time the check
+    // below runs.
+    const result = server.accept(.{ .timeout = Timeout.fromMilliseconds(10) });
+    try std.testing.expectError(error.Timeout, result);
+
+    const AcceptError = @typeInfo(@typeInfo(@TypeOf(Server.accept)).@"fn".return_type.?).error_union.error_set;
+    comptime {
+        for (@typeInfo(AcceptError).error_set.error_names.?) |name| {
+            if (std.mem.eql(u8, name, "ConnectionAborted")) {
+                @compileError("Server.accept must retry ConnectionAborted, not report it");
+            }
+        }
+    }
+}
+
+test "Server: accept cancellation" {
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+    const server = try addr.listen(.{});
+    defer server.close();
+
+    const Acceptor = struct {
+        fn run(srv: Server) !void {
+            const stream = try srv.accept(.{});
+            stream.close();
+        }
+    };
+
+    // The test body runs as the runtime's main task, so spawn the acceptor and
+    // give it time to block in accept before canceling. cancel() blocks until
+    // the acceptor finishes, which only happens if the cancellation broke out of
+    // the accept retry loop (a hang here means it did not).
+    var handle = try runtime.spawn(Acceptor.run, .{server});
+    defer handle.cancel();
+    try runtime_mod.sleep(.fromMilliseconds(50));
+    handle.cancel();
+
+    try std.testing.expectError(error.Canceled, handle.join());
 }
 
 test "Stream.Reader/Writer.fromStd" {
@@ -2647,6 +2858,13 @@ test "multi-executor: cross-loop socket stress (full-duplex + migration + fd reu
 // receive, so the reader runs out of input and sees EOF early. That holds in any
 // build mode, though safe builds usually trip the double-completion assertion
 // first.
+/// Decodes an `@intFromError` code stored in an atomic slot. 0 means nothing
+/// was recorded.
+fn errName(code: u16) []const u8 {
+    if (code == 0) return "none";
+    return @errorName(@errorFromInt(code));
+}
+
 test "multi-executor: timeout cancel racing a cross-loop readiness edge" {
     if (builtin.single_threaded) return error.SkipZigTest;
 
@@ -2654,12 +2872,30 @@ test "multi-executor: timeout cancel racing a cross-loop readiness edge" {
         const pairs = 8;
         const per_pair = 300;
 
+        // Failures are counted per cause, not lumped together: when this test
+        // fails it is on a machine nobody can attach a debugger to, and
+        // "expected 0, found 2" does not say whether a reader lost a byte or a
+        // writer tripped over a peer that had already gone away. The two mean
+        // different things - the first is the bug this test hunts, the second
+        // is usually a consequence of it - and the counters have to tell them
+        // apart on their own.
         const Shared = struct {
-            errors: std.atomic.Value(u32) = .init(0),
+            /// Reader saw EOF before the peer had sent `per_pair` bytes.
+            short_reads: std.atomic.Value(u32) = .init(0),
+            read_errors: std.atomic.Value(u32) = .init(0),
+            write_errors: std.atomic.Value(u32) = .init(0),
+            /// First error of each kind, as `@intFromError`; 0 means none.
+            first_read_err: std.atomic.Value(u16) = .init(0),
+            first_write_err: std.atomic.Value(u16) = .init(0),
             // u32, not u64: 32-bit targets have no lock-free 64-bit atomics, and
             // the total (pairs * per_pair) is far below 2^32 anyway.
             bytes: std.atomic.Value(u32) = .init(0),
             timeouts: std.atomic.Value(u32) = .init(0),
+
+            /// Keeps the first error only, so a cascade cannot bury the cause.
+            fn note(slot: *std.atomic.Value(u16), err: anyerror) void {
+                _ = slot.cmpxchgStrong(0, @intCast(@intFromError(err)), .monotonic, .monotonic);
+            }
         };
 
         fn nudge() void {}
@@ -2683,8 +2919,9 @@ test "multi-executor: timeout cancel racing a cross-loop readiness edge" {
                         _ = sh.timeouts.fetchAdd(1, .monotonic);
                         continue;
                     },
-                    else => {
-                        _ = sh.errors.fetchAdd(1, .monotonic);
+                    else => |e| {
+                        Shared.note(&sh.first_read_err, e);
+                        _ = sh.read_errors.fetchAdd(1, .monotonic);
                         return;
                     },
                 };
@@ -2693,15 +2930,16 @@ test "multi-executor: timeout cancel racing a cross-loop readiness edge" {
                 // This is also what terminates the loop if the race eats a byte,
                 // instead of hanging.
                 if (n == 0) {
-                    _ = sh.errors.fetchAdd(1, .monotonic);
+                    _ = sh.short_reads.fetchAdd(1, .monotonic);
                     return;
                 }
                 got += n;
                 _ = sh.bytes.fetchAdd(@intCast(n), .monotonic);
                 // Hop to another executor, so the next recv is submitted from a
                 // loop other than the one owning this fd's registration.
-                var h = runtime_mod.spawn(nudge, .{}) catch {
-                    _ = sh.errors.fetchAdd(1, .monotonic);
+                var h = runtime_mod.spawn(nudge, .{}) catch |e| {
+                    Shared.note(&sh.first_read_err, e);
+                    _ = sh.read_errors.fetchAdd(1, .monotonic);
                     return;
                 };
                 h.join();
@@ -2712,12 +2950,14 @@ test "multi-executor: timeout cancel racing a cross-loop readiness edge" {
             defer stream.close();
             var rng = std.Random.DefaultPrng.init(seed);
             for (0..per_pair) |_| {
-                runtime_mod.sleep(delay(rng.random())) catch {
-                    _ = sh.errors.fetchAdd(1, .monotonic);
+                runtime_mod.sleep(delay(rng.random())) catch |e| {
+                    Shared.note(&sh.first_write_err, e);
+                    _ = sh.write_errors.fetchAdd(1, .monotonic);
                     return;
                 };
-                stream.writeAll("x", .none) catch {
-                    _ = sh.errors.fetchAdd(1, .monotonic);
+                stream.writeAll("x", .none) catch |e| {
+                    Shared.note(&sh.first_write_err, e);
+                    _ = sh.write_errors.fetchAdd(1, .monotonic);
                     return;
                 };
             }
@@ -2747,7 +2987,33 @@ test "multi-executor: timeout cancel racing a cross-loop readiness edge" {
     }
     try tasks.wait();
 
-    try std.testing.expectEqual(0, sh.errors.load(.monotonic));
+    const short_reads = sh.short_reads.load(.monotonic);
+    const read_errors = sh.read_errors.load(.monotonic);
+    const write_errors = sh.write_errors.load(.monotonic);
+    if (short_reads != 0 or read_errors != 0 or write_errors != 0) {
+        std.debug.print(
+            \\
+            \\  short reads (EOF before {d} bytes): {d}
+            \\  read errors:  {d} (first: {s})
+            \\  write errors: {d} (first: {s})
+            \\  bytes: {d} of {d}, timeouts: {d}
+            \\
+        , .{
+            H.per_pair,                   short_reads,
+            read_errors,                  errName(sh.first_read_err.load(.monotonic)),
+            write_errors,                 errName(sh.first_write_err.load(.monotonic)),
+            sh.bytes.load(.monotonic),    H.pairs * H.per_pair,
+            sh.timeouts.load(.monotonic),
+        });
+    }
+    // A short read is the failure this test exists to catch: the peer sends
+    // exactly `per_pair` bytes before closing, so an early EOF means a
+    // completed recv was discarded by a racing cancel. Write errors are
+    // reported separately because they are usually the downstream effect of a
+    // reader that already gave up and closed, not an independent fault.
+    try std.testing.expectEqual(0, short_reads);
+    try std.testing.expectEqual(0, read_errors);
+    try std.testing.expectEqual(0, write_errors);
     try std.testing.expectEqual(H.pairs * H.per_pair, sh.bytes.load(.monotonic));
     // The cancel path has to have been taken at all, or nothing above is evidence.
     // How often it lands in the window is machine-dependent, so this asserts only
@@ -2911,4 +3177,61 @@ test "multi-executor: full-duplex with task migration disabled" {
 
     try std.testing.expectEqual(@as(u32, 0), sh.errors.load(.monotonic));
     try std.testing.expectEqual(@as(u32, H.conns), sh.verified.load(.monotonic));
+}
+
+test "a canceled task does not start another operation" {
+    // The cancellation check has to happen before the operation is submitted.
+    // An operation that completes inline never parks -- `waitTask` returns on
+    // its fast path -- so a check that only lives in the park loop would let a
+    // canceled task keep issuing work indefinitely, as long as each one
+    // finished without blocking. A small write on a fresh socket is that case.
+    const runtime = try Runtime.init(std.testing.allocator, .{});
+    defer runtime.deinit();
+
+    const Outcome = struct {
+        after_recancel: ?anyerror = null,
+    };
+
+    const ServerTask = struct {
+        fn run(server_port: *Channel(u16)) !void {
+            const addr = try IpAddress.parseIp4("127.0.0.1", 0);
+            const server = try addr.listen(.{});
+            defer server.close();
+            try server_port.send(server.socket.address.ip.getPort());
+            var stream = try server.accept(.{});
+            defer stream.close();
+            // Never reads; the client only needs a peer to exist.
+            runtime_mod.sleep(.fromMilliseconds(60_000)) catch {};
+        }
+    };
+
+    const ClientTask = struct {
+        fn run(server_port: *Channel(u16), outcome: *Outcome) !void {
+            const port = try server_port.receive();
+            const addr = try IpAddress.parseIp4("127.0.0.1", port);
+            var stream = try tcpConnectToAddress(addr, .{});
+            defer stream.close();
+
+            // Wait to be canceled, then put the cancellation back and try to
+            // write. The write must report it rather than run.
+            runtime_mod.sleep(.fromMilliseconds(60_000)) catch |err| {
+                std.debug.assert(err == error.Canceled);
+                runtime_mod.recancel();
+                outcome.after_recancel = if (stream.writeAll("x", .none)) |_| null else |e| e;
+            };
+        }
+    };
+
+    var server_port_buf: [1]u16 = undefined;
+    var server_port_ch = Channel(u16).init(&server_port_buf);
+    var outcome: Outcome = .{};
+
+    var group: Group = .init;
+    try group.spawn(ServerTask.run, .{&server_port_ch});
+    try group.spawn(ClientTask.run, .{ &server_port_ch, &outcome });
+
+    runtime_mod.sleep(.fromMilliseconds(100)) catch {};
+    group.cancel();
+
+    try std.testing.expectEqual(@as(?anyerror, error.Canceled), outcome.after_recancel);
 }

@@ -19,6 +19,7 @@ const NetRecvFrom = @import("../completion.zig").NetRecvFrom;
 const NetSendTo = @import("../completion.zig").NetSendTo;
 const NetRecvMsg = @import("../completion.zig").NetRecvMsg;
 const NetSendMsg = @import("../completion.zig").NetSendMsg;
+const NetSendFile = @import("../completion.zig").NetSendFile;
 const NetPoll = @import("../completion.zig").NetPoll;
 const NetClose = @import("../completion.zig").NetClose;
 const PipePoll = @import("../completion.zig").PipePoll;
@@ -30,27 +31,98 @@ const sockreg = @import("../sockreg.zig");
 
 pub const NetHandle = net.fd_t;
 
-const BackendCapabilities = @import("../completion.zig").BackendCapabilities;
+const Op = @import("../completion.zig").Op;
+const Support = @import("../completion.zig").Support;
 
-pub const capabilities: BackendCapabilities = .{
-    .process_wait = true,
-    // Only Darwin has usable absolute wall-clock EVFILT_TIMER semantics
-    // (NOTE_ABSOLUTE = gettimeofday, NOTE_MACH_CONTINUOUS_TIME = suspend-aware).
-    // The BSDs' EVFILT_TIMER absolute clock is monotonic-only and underspecified
-    // with no CLOCK_REALTIME timer, so they keep the capped poll-timeout fallback.
-    .native_wall_timers = builtin.os.tag.isDarwin(),
-    // A socket fd is registered in exactly one loop's kqueue (per direction), but
-    // the op can be submitted from another loop and is serviced/completed by the
-    // registering loop when its edge fires - completions finish on a thread other
-    // than the submitter. That makes active/inflight accounting shared, like IOCP.
-    .is_multi_threaded = true,
-};
+// Only Darwin has usable absolute wall-clock EVFILT_TIMER semantics
+// (NOTE_ABSOLUTE = gettimeofday, NOTE_MACH_CONTINUOUS_TIME = suspend-aware).
+// The BSDs' EVFILT_TIMER absolute clock is monotonic-only and underspecified
+// with no CLOCK_REALTIME timer, so they keep the capped poll-timeout fallback.
+pub const native_wall_timers = builtin.os.tag.isDarwin();
+pub const supports_nonblocking_file_io = false;
+
+pub fn capability(comptime op: Op) Support {
+    return switch (op) {
+        .file_read_streaming, .file_write_streaming => .maybe,
+        // FreeBSD's sendfile is asynchronous with respect to file reads. The
+        // Darwin implementation can block the loop and deliberately falls back.
+        .net_send_file => if (builtin.os.tag == .freebsd) .yes else .no,
+        .file_open,
+        .file_create,
+        .file_close,
+        .file_read,
+        .file_write,
+        .file_sync,
+        .file_set_size,
+        .file_set_permissions,
+        .file_set_owner,
+        .file_set_timestamps,
+        .dir_create_dir,
+        .dir_rename,
+        .dir_rename_preserve,
+        .dir_delete_file,
+        .dir_delete_dir,
+        .file_size,
+        .file_stat,
+        .dir_open,
+        .dir_close,
+        .dir_set_permissions,
+        .dir_set_owner,
+        .dir_set_file_permissions,
+        .dir_set_file_owner,
+        .dir_set_file_timestamps,
+        .dir_sym_link,
+        .dir_read_link,
+        .dir_hard_link,
+        .dir_access,
+        .dir_read,
+        .dir_real_path,
+        .dir_real_path_file,
+        .file_real_path,
+        .file_hard_link,
+        .device_io_control,
+        => .no,
+        .group,
+        .timer,
+        .async,
+        .work,
+        .net_open,
+        .net_bind,
+        .net_listen,
+        .net_connect,
+        .net_accept,
+        .net_recv,
+        .net_send,
+        .net_recvfrom,
+        .net_sendto,
+        .net_recvmsg,
+        .net_sendmsg,
+        .net_poll,
+        .net_shutdown,
+        .net_close,
+        .pipe_poll,
+        .pipe_create,
+        .pipe_close,
+        .mach_port,
+        .process_wait,
+        => .yes,
+    };
+}
+
+pub fn supports(_: *const Self, comptime op: Op, data: *op.toType()) bool {
+    comptime std.debug.assert(capability(op) == .maybe);
+    if (comptime op == .file_read_streaming or op == .file_write_streaming) {
+        return common.resolveStreamingSupport(data);
+    }
+    @compileError("unhandled runtime kqueue capability: " ++ @tagName(op));
+}
 
 pub const SharedState = struct {
-    /// Group-shared accounting: a completion submitted on one loop may be
-    /// finished by the loop that owns the fd registration, so active/inflight_io
-    /// are shared atomics rather than per-LoopState fields (see LoopState).
-    active: std.atomic.Value(usize) = .init(0),
+    /// Backend-internal inflight count: ops accepted by submit() and not yet
+    /// completed. A completion submitted on one loop may be finished by the
+    /// loop that owns the fd registration, so the count is a group-shared
+    /// atomic (either loop's decrInflight hits the same storage). Read by
+    /// hasInflight() to skip the poll syscall when nothing can arrive.
     inflight_io: std.atomic.Value(usize) = .init(0),
     /// Cross-loop single-owner socket registration table, shared by every loop
     /// in the group. See sockreg.zig.
@@ -67,6 +139,18 @@ pub const NetShutdownError = error{
 };
 
 const Self = @This();
+
+/// Progress of a native sendfile op. Initialized in submit() (which caps the
+/// request to the file size) and advanced by the checkCompletion arm each time
+/// the socket's write edge fires.
+pub const NetSendFileData = struct {
+    /// File offset for the next sendfile call.
+    offset: u64 = 0,
+    /// Bytes still to send; 0 means the op is done.
+    remaining: usize = 0,
+    /// Total bytes sent so far (the operation result).
+    sent: usize = 0,
+};
 
 const log = @import("../../common.zig").log;
 
@@ -196,7 +280,18 @@ pub fn wake(self: *Self, state: *LoopState) void {
         .data = 0,
         .udata = 0,
     }};
-    _ = std.c.kevent(self.kqueue_fd, &changes, 1, &.{}, 0, null);
+    // A silently failed trigger strands the sleeping loop until its poll
+    // timeout: wake_requested is already set, so later wakers skip the
+    // syscall. Retry EINTR; anything else means the waker is broken and
+    // every subsequent wake would be lost, so fail loudly.
+    while (true) {
+        const rc = std.c.kevent(self.kqueue_fd, &changes, 1, &.{}, 0, null);
+        switch (posix.errno(rc)) {
+            .SUCCESS => return,
+            .INTR => continue,
+            else => |err| std.debug.panic("kqueue: waker NOTE_TRIGGER failed: {t}", .{err}),
+        }
+    }
 }
 
 /// Arm/update/disarm the given wall clock's EVFILT_TIMER to an absolute deadline
@@ -457,11 +552,26 @@ pub fn probeEvent(fd: NetHandle, dir: sockreg.Dir) std.c.Kevent {
     };
 }
 
+/// Drop one inflight op. Called via LoopState.markCompletedFromBackend from
+/// whichever loop finishes the op; the storage is group-shared, so any
+/// instance's decrement balances any instance's increment.
+pub fn decrInflight(self: *Self) void {
+    _ = self.shared.inflight_io.fetchSub(1, .monotonic);
+}
+
+/// Whether poll() could produce completions. Used by the loop to skip the
+/// wait syscall in no-wait ticks when nothing can arrive.
+pub fn hasInflight(self: *const Self) bool {
+    return self.shared.inflight_io.load(.monotonic) > 0;
+}
+
 /// Submit a completion to the backend - infallible.
 /// On error, completes the operation immediately with error.Unexpected.
 pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
-    c.state = .running;
-    state.incrActive();
+    // Counted for every accepted op (sync completers decrement right back via
+    // markCompletedFromBackend), mirroring the decrInflight in every completion
+    // path so the balance needs no per-path reasoning.
+    _ = self.shared.inflight_io.fetchAdd(1, .monotonic);
 
     switch (c.op) {
         .group, .timer, .async, .work => std.debug.panic("zio kqueue: loop-managed op {s} reached backend submit", .{@tagName(c.op)}),
@@ -537,8 +647,32 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
 
         // File operations are handled by Loop via thread pool
         .file_open, .file_create, .file_close, .file_read, .file_write, .file_sync, .file_size, .file_set_size, .file_set_permissions, .file_set_owner, .file_set_timestamps, .file_stat, .dir_open, .dir_close, .dir_read, .dir_create_dir, .dir_rename, .dir_rename_preserve, .dir_delete_file, .dir_delete_dir, .dir_set_permissions, .dir_set_owner, .dir_set_file_permissions, .dir_set_file_owner, .dir_set_file_timestamps, .dir_sym_link, .dir_read_link, .dir_hard_link, .dir_access, .dir_real_path, .dir_real_path_file, .file_real_path, .file_hard_link, .device_io_control => std.debug.panic("zio kqueue: file op {s} reached backend submit (should be thread-pooled)", .{@tagName(c.op)}),
-        // Driven by Loop's generic read/write fallback, never reaches the backend.
-        .net_send_file => std.debug.panic("zio kqueue: net_send_file reached backend submit (should use the loop fallback)", .{}),
+
+        .file_open, .file_create, .file_close, .file_read, .file_write, .file_sync, .file_size, .file_set_size, .file_set_permissions, .file_set_owner, .file_set_timestamps, .file_stat, .dir_open, .dir_close, .dir_read, .dir_create_dir, .dir_rename, .dir_rename_preserve, .dir_delete_file, .dir_delete_dir, .dir_set_permissions, .dir_set_owner, .dir_set_file_permissions, .dir_set_file_owner, .dir_set_file_timestamps, .dir_sym_link, .dir_read_link, .dir_hard_link, .dir_access, .dir_real_path, .dir_real_path_file, .file_real_path, .file_hard_link, .device_io_control => unreachable,
+        .net_send_file => {
+            // Driven by Loop's generic read/write fallback on backends
+            // without native sendfile, never reaches the backend there.
+            if (comptime capability(.net_send_file) != .yes) unreachable;
+            // Cap the request to the current file size once, so the
+            // continuation can treat "remaining == 0" as done and never
+            // spins on a writable socket at EOF. Then drive the sendfile
+            // syscall through the generic single-owner socket path like
+            // any other write op: drain to EAGAIN, park on the owner
+            // loop, resume on the write edge (see checkCompletion).
+            const data = c.cast(NetSendFile);
+            const file_size = fs.fileSize(data.file) catch |err| {
+                c.setError(switch (err) {
+                    error.PermissionDenied => error.AccessDenied,
+                    else => |e| e,
+                });
+                state.markCompletedFromBackend(c);
+                return;
+            };
+            data.internal.offset = data.offset;
+            data.internal.remaining = @intCast(@min(@as(u64, data.remaining), file_size -| data.offset));
+            sockreg.submitIo(self, state, c);
+        },
+
     }
 }
 
@@ -641,7 +775,7 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
             while (iter) |completion| {
                 iter = completion.next;
 
-                if (completion.state == .completed or completion.state == .dead) {
+                if (completion.loadState().phase != .running) {
                     continue;
                 }
 
@@ -674,13 +808,13 @@ fn handleKqueueError(event: *const std.c.Kevent, comptime errnoToError: fn (net.
     if (has_error) {
         // event.data contains the errno when EV_ERROR is set
         if (event.data != 0) {
-            return errnoToError(@enumFromInt(@as(i32, @intCast(event.data))));
+            return errnoToError(@fromBackingInt(@intCast(@as(i32, @intCast(event.data)))));
         }
     }
 
     const sock_err = net.getSockError(@intCast(event.ident)) catch return error.Unexpected;
     if (sock_err == 0) return null; // No actual error, caller should retry operation
-    return errnoToError(@enumFromInt(sock_err));
+    return errnoToError(@fromBackingInt(@intCast(sock_err)));
 }
 
 pub fn checkCompletion(comp: *Completion, event: *const std.c.Kevent) CheckResult {
@@ -812,6 +946,46 @@ pub fn checkCompletion(comp: *Completion, event: *const std.c.Kevent) CheckResul
                 },
             }
         },
+        .net_send_file => {
+            if (comptime capability(.net_send_file) != .yes) unreachable;
+            const data = comp.cast(NetSendFile);
+            if (handleKqueueError(event, net.errnoToSendError)) |err| {
+                comp.setError(err);
+                return .completed;
+            }
+            while (data.internal.remaining > 0) {
+                var sbytes: posix.off_t = 0;
+                const rc = std.c.sendfile(
+                    data.file,
+                    data.handle,
+                    @intCast(data.internal.offset),
+                    data.internal.remaining,
+                    null,
+                    &sbytes,
+                    0,
+                );
+                // Progress is reported through sbytes even when the call
+                // "fails" (EAGAIN/EINTR after a partial transfer).
+                const sent: usize = @intCast(sbytes);
+                data.internal.offset += sent;
+                data.internal.remaining -= sent;
+                data.internal.sent += sent;
+                switch (posix.errno(rc)) {
+                    // Success means the whole remaining request was sent,
+                    // or the file was truncated under us (sendfile stops
+                    // at EOF); either way there is nothing left to drive.
+                    .SUCCESS => break,
+                    .INTR => continue,
+                    .AGAIN => return .requeue,
+                    else => |err| {
+                        comp.setError(net.errnoToSendError(err));
+                        return .completed;
+                    },
+                }
+            }
+            comp.setResult(.net_send_file, data.internal.sent);
+            return .completed;
+        },
         .net_poll => {
             // For poll operations, EOF means the socket is "ready" (will return EOF on next read).
             // Reuse handleKqueueError so we only fail on real socket errors (SO_ERROR != 0),
@@ -828,7 +1002,7 @@ pub fn checkCompletion(comp: *Completion, event: *const std.c.Kevent) CheckResul
             // Check for actual errors first
             const has_error = (event.flags & EV_ERROR) != 0;
             if (has_error and event.data != 0) {
-                comp.setError(fs.errnoToFileReadError(@enumFromInt(@as(i32, @intCast(event.data)))));
+                comp.setError(fs.errnoToFileReadError(@fromBackingInt(@intCast(@as(i32, @intCast(event.data))))));
                 return .completed;
             }
             // Try to read - there might still be data in the pipe buffer
@@ -860,7 +1034,7 @@ pub fn checkCompletion(comp: *Completion, event: *const std.c.Kevent) CheckResul
             if (has_error and event.data != 0) {
                 // BSD systems return EBADF (NotOpenForWriting) when writing to closed pipe
                 // Normalize to BrokenPipe for consistency with Linux
-                const err = fs.errnoToFileWriteError(@enumFromInt(@as(i32, @intCast(event.data))));
+                const err = fs.errnoToFileWriteError(@fromBackingInt(@intCast(@as(i32, @intCast(event.data)))));
                 comp.setError(switch (err) {
                     error.NotOpenForWriting => error.BrokenPipe,
                     else => err,

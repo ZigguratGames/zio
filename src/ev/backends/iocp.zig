@@ -1,4 +1,5 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const os = @import("../../os/root.zig");
 const windows = @import("../../os/windows.zig");
 const net = @import("../../os/net.zig");
@@ -30,7 +31,7 @@ const PipeClose = @import("../completion.zig").PipeClose;
 const ProcessWait = @import("../completion.zig").ProcessWait;
 
 // WAIT_IO_COMPLETION is returned when an alertable wait is interrupted by an APC
-const WAIT_IO_COMPLETION: windows.Win32Error = @enumFromInt(0xC0);
+const WAIT_IO_COMPLETION: windows.Win32Error = @fromBackingInt(@intCast(0xC0));
 
 // Winsock extension function GUIDs
 const WSAID_ACCEPTEX = windows.GUID{
@@ -160,24 +161,89 @@ fn loadWinsockExtension(comptime T: type, sock: windows.SOCKET, guid: windows.GU
 
 pub const NetHandle = net.fd_t;
 
-const BackendCapabilities = @import("../completion.zig").BackendCapabilities;
+const Op = @import("../completion.zig").Op;
+const Support = @import("../completion.zig").Support;
 
-pub const capabilities: BackendCapabilities = .{
-    .file_read = true,
-    .file_write = true,
-    // Streaming (positionless) read/write uses overlapped ReadFile/WriteFile
-    // with a zero offset, but only for non-seekable handles (pipes/stdio).
-    // Loop routes pollable fds here; seekable fds go to the thread pool.
-    .file_read_streaming = false,
-    .file_write_streaming = false,
-    .is_multi_threaded = true,
-    .process_wait = true,
-    // Zero-copy file-to-socket transfer via the TransmitFile extension.
-    .net_send_file = true,
-    // Boot/real deadlines are armed via per-loop waitable timers whose
-    // completion-routine APC fires during the alertable poll wait.
-    .native_wall_timers = true,
-};
+// Boot/real deadlines are armed via per-loop waitable timers whose
+// completion-routine APC fires during the alertable poll wait.
+pub const native_wall_timers = true;
+pub const supports_nonblocking_file_io = true;
+
+pub fn capability(comptime op: Op) Support {
+    return switch (op) {
+        // Streaming (positionless) read/write uses overlapped ReadFile/WriteFile
+        // only for non-seekable handles. Seekable handles use the thread pool.
+        .file_read_streaming, .file_write_streaming => .maybe,
+        .file_open,
+        .file_create,
+        .file_close,
+        .file_sync,
+        .file_set_size,
+        .file_set_permissions,
+        .file_set_owner,
+        .file_set_timestamps,
+        .dir_create_dir,
+        .dir_rename,
+        .dir_rename_preserve,
+        .dir_delete_file,
+        .dir_delete_dir,
+        .file_size,
+        .file_stat,
+        .dir_open,
+        .dir_close,
+        .dir_set_permissions,
+        .dir_set_owner,
+        .dir_set_file_permissions,
+        .dir_set_file_owner,
+        .dir_set_file_timestamps,
+        .dir_sym_link,
+        .dir_read_link,
+        .dir_hard_link,
+        .dir_access,
+        .dir_read,
+        .dir_real_path,
+        .dir_real_path_file,
+        .file_real_path,
+        .file_hard_link,
+        .device_io_control,
+        => .no,
+        .group,
+        .timer,
+        .async,
+        .work,
+        .net_open,
+        .net_bind,
+        .net_listen,
+        .net_connect,
+        .net_accept,
+        .net_recv,
+        .net_send,
+        .net_recvfrom,
+        .net_sendto,
+        .net_recvmsg,
+        .net_sendmsg,
+        .net_poll,
+        .net_shutdown,
+        .net_close,
+        .net_send_file,
+        .file_read,
+        .file_write,
+        .pipe_poll,
+        .pipe_create,
+        .pipe_close,
+        .mach_port,
+        .process_wait,
+        => .yes,
+    };
+}
+
+pub fn supports(_: *const Self, comptime op: Op, data: *op.toType()) bool {
+    comptime std.debug.assert(capability(op) == .maybe);
+    if (comptime op == .file_read_streaming or op == .file_write_streaming) {
+        return common.resolveStreamingSupport(data);
+    }
+    @compileError("unhandled runtime IOCP capability: " ++ @tagName(op));
+}
 
 // Backend-specific data stored in Completion.internal
 pub const CompletionData = struct {
@@ -246,16 +312,19 @@ const ExtensionFunctions = struct {
     transmitfile: LPFN_TRANSMITFILE,
 };
 
+pub const InflightInt = usize;
+
 pub const SharedState = struct {
     mutex: os.Mutex = .init(),
     refcount: usize = 0,
     iocp: windows.HANDLE = windows.INVALID_HANDLE_VALUE,
 
-    /// Multi-threaded counters: multiple loops may submit and
-    /// complete I/O on the same IOCP port, so active/inflight_io
-    /// are shared atomics rather than per-LoopState fields.
-    active: std.atomic.Value(u64) = .init(0),
-    inflight_io: std.atomic.Value(u64) = .init(0),
+    /// Backend-internal inflight count: ops accepted by submit() and not yet
+    /// completed. Any loop of the group may dequeue any completion from the
+    /// shared port, so the count is a group-shared atomic (any instance's
+    /// decrInflight balances any instance's increment). Read by hasInflight()
+    /// to skip the wait syscall when nothing can arrive.
+    inflight_io: std.atomic.Value(InflightInt) = .init(0),
 
     // Extension functions loaded once globally (family-independent)
     exts: ExtensionFunctions = undefined,
@@ -282,7 +351,6 @@ pub const SharedState = struct {
 
             // Reset shared accounting in case this SharedState is being
             // reused after a previous teardown that left stale counters.
-            self.active.store(0, .release);
             self.inflight_io.store(0, .release);
 
             // Load all extension functions using a temporary socket
@@ -450,9 +518,24 @@ pub fn wake(self: *Self, state: *LoopState) void {
     }
 }
 
+/// Drop one inflight op. Called via LoopState.markCompletedFromBackend from
+/// whichever loop dequeues the completion; the storage is group-shared, so
+/// any instance's decrement balances any instance's increment.
+pub fn decrInflight(self: *Self) void {
+    _ = self.shared_state.inflight_io.fetchSub(1, .monotonic);
+}
+
+/// Whether poll() could produce completions. Used by the loop to skip the
+/// wait syscall in no-wait ticks when nothing can arrive.
+pub fn hasInflight(self: *const Self) bool {
+    return self.shared_state.inflight_io.load(.monotonic) > 0;
+}
+
 pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
-    c.state = .running;
-    state.incrActive();
+    // Counted for every accepted op (sync completers decrement right back via
+    // markCompletedFromBackend), mirroring the decrInflight in every completion
+    // path so the balance needs no per-path reasoning.
+    _ = self.shared_state.inflight_io.fetchAdd(1, .monotonic);
 
     switch (c.op) {
         .group, .timer, .async, .work => unreachable, // Managed by the loop
@@ -617,7 +700,7 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
         .file_real_path,
         .file_hard_link,
         .device_io_control,
-        => unreachable, // These are handled by thread pool (capabilities = false)
+        => unreachable, // These are handled by thread pool (capability(op) == .no)
 
         .net_send_file => {
             const data = c.cast(NetSendFile);
@@ -722,7 +805,7 @@ fn submitAccept(self: *Self, state: *LoopState, data: *NetAccept) !void {
     const exts = self.shared_state.exts;
 
     // Create new socket for the accepted connection (same family as listening socket)
-    const accept_socket = try net.socket(@enumFromInt(family), .stream, .ip, data.flags);
+    const accept_socket = try net.socket(@fromBackingInt(@intCast(family)), .stream, .ip, data.flags);
     errdefer net.close(accept_socket);
 
     // Publish the accepted socket into the op BEFORE issuing AcceptEx (#530). The
@@ -1250,7 +1333,7 @@ fn submitFileRead(self: *Self, state: *LoopState, data: *FileRead) !void {
         } else if (err != .IO_PENDING) {
             // Real error - complete immediately with error
             log.err("ReadFile failed: {}", .{err});
-            data.c.setError(fs.errnoToFileReadError(@enumFromInt(@intFromEnum(err))));
+            data.c.setError(fs.errnoToFileReadError(@fromBackingInt(@intCast(@backingInt(err)))));
             state.markCompletedFromBackend(&data.c);
             return;
         }
@@ -1285,7 +1368,7 @@ fn submitFileWrite(self: *Self, state: *LoopState, data: *FileWrite) !void {
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
             log.err("WriteFile failed: {}", .{err});
-            data.c.setError(fs.errnoToFileWriteError(@enumFromInt(@intFromEnum(err))));
+            data.c.setError(fs.errnoToFileWriteError(@fromBackingInt(@intCast(@backingInt(err)))));
             state.markCompletedFromBackend(&data.c);
             return;
         }
@@ -1373,7 +1456,7 @@ fn submitFileReadStreaming(self: *Self, state: *LoopState, data: *FileReadStream
         } else if (err != .IO_PENDING) {
             // Real error - complete immediately with error
             log.err("ReadFile (pipe) failed: {}", .{err});
-            data.c.setError(fs.errnoToFileReadError(@enumFromInt(@intFromEnum(err))));
+            data.c.setError(fs.errnoToFileReadError(@fromBackingInt(@intCast(@backingInt(err)))));
             state.markCompletedFromBackend(&data.c);
             return;
         }
@@ -1412,7 +1495,7 @@ fn submitFileWriteStreaming(self: *Self, state: *LoopState, data: *FileWriteStre
         if (err != .IO_PENDING) {
             // Real error - complete immediately with error
             log.err("WriteFile (pipe) failed: {}", .{err});
-            data.c.setError(fs.errnoToFileWriteError(@enumFromInt(@intFromEnum(err))));
+            data.c.setError(fs.errnoToFileWriteError(@fromBackingInt(@intCast(@backingInt(err)))));
             state.markCompletedFromBackend(&data.c);
             return;
         }
@@ -1427,7 +1510,7 @@ fn submitPipeClose(self: *Self, state: *LoopState, data: *PipeClose) !void {
     if (result == windows.FALSE) {
         const err = windows.GetLastError();
         log.err("CloseHandle (pipe) failed: {}", .{err});
-        data.c.setError(fs.errnoToFileCloseError(@enumFromInt(@intFromEnum(err))));
+        data.c.setError(fs.errnoToFileCloseError(@fromBackingInt(@intCast(@backingInt(err)))));
     } else {
         data.c.setResult(.pipe_close, {});
     }
@@ -1481,10 +1564,9 @@ pub fn cancel(self: *Self, state: *LoopState, target: *Completion) void {
     _ = self;
     _ = state;
 
-    switch (target.state) {
+    switch (target.loadState().phase) {
         .new => {
-            // UNREACHABLE: When cancel is added via loop.add() and target.state == .new,
-            // loop.add() handles it directly and doesn't call backend.cancel().
+            // UNREACHABLE: cancelLocal only forwards running completions.
             unreachable;
         },
         .running => {
@@ -1791,7 +1873,7 @@ fn processCompletion(self: *Self, state: *LoopState, entry: *const windows.OVERL
                     // Whole requested range sent.
                     c.setResult(.net_send_file, data.internal.total);
                     state.markCompletedFromBackend(c);
-                } else if (c.cancel_state.load(.acquire).requested) {
+                } else if (c.loadState().cancel_requested) {
                     // Cancel was requested between this chunk completing and the
                     // re-arm. CancelIoEx already returned NOT_FOUND (the chunk
                     // had already completed), so we must check the flag here to
@@ -1977,7 +2059,7 @@ fn processCompletion(self: *Self, state: *LoopState, entry: *const windows.OVERL
 
             if (result == .FALSE) {
                 const err = windows.GetLastError();
-                c.setError(fs.errnoToFileWriteError(@enumFromInt(@intFromEnum(err))));
+                c.setError(fs.errnoToFileWriteError(@fromBackingInt(@intCast(@backingInt(err)))));
             } else {
                 c.setResult(.file_write, @intCast(bytes_transferred));
             }
@@ -2024,7 +2106,7 @@ fn processCompletion(self: *Self, state: *LoopState, entry: *const windows.OVERL
 
             if (result == .FALSE) {
                 const err = windows.GetLastError();
-                c.setError(fs.errnoToFileWriteError(@enumFromInt(@intFromEnum(err))));
+                c.setError(fs.errnoToFileWriteError(@fromBackingInt(@intCast(@backingInt(err)))));
             } else {
                 c.setResult(.file_write_streaming, @intCast(bytes_transferred));
             }
@@ -2042,7 +2124,7 @@ fn processCompletion(self: *Self, state: *LoopState, entry: *const windows.OVERL
                 data.internal.wait_handle = windows.INVALID_HANDLE_VALUE;
             }
 
-            if (c.cancel_state.load(.acquire).requested) {
+            if (c.loadState().cancel_requested) {
                 c.setError(error.Canceled);
             } else {
                 var exit_code: windows.DWORD = 0;

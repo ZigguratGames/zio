@@ -1,17 +1,17 @@
 const std = @import("std");
 const linux = std.os.linux;
-const posix = @import("../../os/posix.zig");
-const net = @import("../../os/net.zig");
-const fs = @import("../../os/fs.zig");
-const linux_sys = @import("../../os/system/linux.zig");
-const time = @import("../../os/time.zig");
-const Duration = @import("../../time.zig").Duration;
-const Clock = @import("../../time.zig").Clock;
-const common = @import("common.zig");
-const LoopState = @import("../loop.zig").LoopState;
-const Completion = @import("../completion.zig").Completion;
-const Queue = @import("../queue.zig").Queue;
-const Cancel = @import("../completion.zig").Cancel;
+const posix = @import("../../../os/posix.zig");
+const net = @import("../../../os/net.zig");
+const fs = @import("../../../os/fs.zig");
+const linux_sys = @import("../../../os/system/linux.zig");
+const time = @import("../../../os/time.zig");
+const Duration = @import("../../../time.zig").Duration;
+const Clock = @import("../../../time.zig").Clock;
+const common = @import("../common.zig");
+const LoopState = @import("../../loop.zig").LoopState;
+const Completion = @import("../../completion.zig").Completion;
+const Queue = @import("../../queue.zig").Queue;
+const Cancel = @import("../../completion.zig").Cancel;
 
 // user_data encoding. A *Completion pointer is aligned, so its low bit is 0;
 // internal ops set the low bit and pack a kind (bits 1-2) plus, for the wall
@@ -22,7 +22,7 @@ const UD_SPECIAL: u64 = 1;
 const SpecialKind = enum(u2) { waker = 0, cancel = 1, wall_boot = 2, wall_real = 3 };
 
 fn specialUd(kind: SpecialKind, generation: u32) u64 {
-    return UD_SPECIAL | (@as(u64, @intFromEnum(kind)) << 1) | (@as(u64, generation) << 3);
+    return UD_SPECIAL | (@as(u64, @backingInt(kind)) << 1) | (@as(u64, generation) << 3);
 }
 
 fn udIsSpecial(ud: u64) bool {
@@ -30,7 +30,7 @@ fn udIsSpecial(ud: u64) bool {
 }
 
 fn udKind(ud: u64) SpecialKind {
-    return @enumFromInt(@as(u2, @truncate(ud >> 1)));
+    return @fromBackingInt(@intCast(@as(u2, @truncate(ud >> 1))));
 }
 
 fn udGeneration(ud: u64) u32 {
@@ -41,85 +41,139 @@ fn wallKind(idx: usize) SpecialKind {
     return if (idx == 0) .wall_boot else .wall_real;
 }
 
-const NetOpen = @import("../completion.zig").NetOpen;
-const NetConnect = @import("../completion.zig").NetConnect;
-const NetAccept = @import("../completion.zig").NetAccept;
-const NetRecv = @import("../completion.zig").NetRecv;
-const NetSend = @import("../completion.zig").NetSend;
-const NetRecvFrom = @import("../completion.zig").NetRecvFrom;
-const NetSendTo = @import("../completion.zig").NetSendTo;
-const NetRecvMsg = @import("../completion.zig").NetRecvMsg;
-const NetSendMsg = @import("../completion.zig").NetSendMsg;
-const NetPoll = @import("../completion.zig").NetPoll;
-const NetClose = @import("../completion.zig").NetClose;
-const NetShutdown = @import("../completion.zig").NetShutdown;
-const FileOpen = @import("../completion.zig").FileOpen;
-const FileCreate = @import("../completion.zig").FileCreate;
-const DirCreateDir = @import("../completion.zig").DirCreateDir;
-const DirRename = @import("../completion.zig").DirRename;
-const DirRenamePreserve = @import("../completion.zig").DirRenamePreserve;
-const DirDeleteFile = @import("../completion.zig").DirDeleteFile;
-const DirDeleteDir = @import("../completion.zig").DirDeleteDir;
-const FileSize = @import("../completion.zig").FileSize;
-const FileStat = @import("../completion.zig").FileStat;
-const FileClose = @import("../completion.zig").FileClose;
-const FileRead = @import("../completion.zig").FileRead;
-const FileWrite = @import("../completion.zig").FileWrite;
-const FileReadStreaming = @import("../completion.zig").FileReadStreaming;
-const FileWriteStreaming = @import("../completion.zig").FileWriteStreaming;
-const FileSync = @import("../completion.zig").FileSync;
-const FileSetSize = @import("../completion.zig").FileSetSize;
-const DirOpen = @import("../completion.zig").DirOpen;
-const DirClose = @import("../completion.zig").DirClose;
-const PipePoll = @import("../completion.zig").PipePoll;
-const PipeClose = @import("../completion.zig").PipeClose;
-const ProcessWait = @import("../completion.zig").ProcessWait;
+const NetOpen = @import("../../completion.zig").NetOpen;
+const NetBind = @import("../../completion.zig").NetBind;
+const NetListen = @import("../../completion.zig").NetListen;
+const NetConnect = @import("../../completion.zig").NetConnect;
+const NetAccept = @import("../../completion.zig").NetAccept;
+const NetRecv = @import("../../completion.zig").NetRecv;
+const NetSend = @import("../../completion.zig").NetSend;
+const NetRecvFrom = @import("../../completion.zig").NetRecvFrom;
+const NetSendTo = @import("../../completion.zig").NetSendTo;
+const NetRecvMsg = @import("../../completion.zig").NetRecvMsg;
+const NetSendMsg = @import("../../completion.zig").NetSendMsg;
+const NetSendFile = @import("../../completion.zig").NetSendFile;
+const NetPoll = @import("../../completion.zig").NetPoll;
+const NetClose = @import("../../completion.zig").NetClose;
+const NetShutdown = @import("../../completion.zig").NetShutdown;
+const FileOpen = @import("../../completion.zig").FileOpen;
+const FileCreate = @import("../../completion.zig").FileCreate;
+const DirCreateDir = @import("../../completion.zig").DirCreateDir;
+const DirRename = @import("../../completion.zig").DirRename;
+const DirRenamePreserve = @import("../../completion.zig").DirRenamePreserve;
+const DirDeleteFile = @import("../../completion.zig").DirDeleteFile;
+const DirDeleteDir = @import("../../completion.zig").DirDeleteDir;
+const FileSize = @import("../../completion.zig").FileSize;
+const FileStat = @import("../../completion.zig").FileStat;
+const FileClose = @import("../../completion.zig").FileClose;
+const FileRead = @import("../../completion.zig").FileRead;
+const FileWrite = @import("../../completion.zig").FileWrite;
+const FileReadStreaming = @import("../../completion.zig").FileReadStreaming;
+const FileWriteStreaming = @import("../../completion.zig").FileWriteStreaming;
+const FileSync = @import("../../completion.zig").FileSync;
+const FileSetSize = @import("../../completion.zig").FileSetSize;
+const DirOpen = @import("../../completion.zig").DirOpen;
+const DirClose = @import("../../completion.zig").DirClose;
+const PipePoll = @import("../../completion.zig").PipePoll;
+const PipeClose = @import("../../completion.zig").PipeClose;
+const ProcessWait = @import("../../completion.zig").ProcessWait;
 
 pub const NetHandle = net.fd_t;
 
-const BackendCapabilities = @import("../completion.zig").BackendCapabilities;
+const Op = @import("../../completion.zig").Op;
+const Support = @import("../../completion.zig").Support;
 
-pub const capabilities: BackendCapabilities = .{
-    .file_read = true,
-    .file_write = true,
-    .file_read_streaming = true,
-    .file_write_streaming = true,
-    .file_open = true,
-    .file_create = true,
-    .file_close = true,
-    .file_sync = true,
-    // Runtime-dispatched, not statically native: the native IORING_OP_FTRUNCATE
-    // needs Linux >= 6.9. `false` makes the completion carry a DelegatedWork so
-    // the thread-pool path is available; the Loop upgrades to the native SQE at
-    // runtime when `fileSetSizeSupported()` (probed once) says the kernel has it.
-    .file_set_size = false,
-    .dir_create_dir = true,
-    .dir_rename = true,
-    .dir_rename_preserve = true,
-    .dir_delete_file = true,
-    .dir_delete_dir = true,
-    .file_size = true,
-    .file_stat = true,
-    .dir_open = true,
-    .dir_close = true,
-    .process_wait = true,
-    .native_wall_timers = true,
+pub const native_wall_timers = true;
+pub const supports_nonblocking_file_io = true;
+
+pub fn capability(comptime op: Op) Support {
+    return switch (op) {
+        // These opcodes postdate the minimum kernel accepted by ring setup and
+        // are resolved from IORING_REGISTER_PROBE at runtime.
+        .file_set_size, .process_wait => .maybe,
+        .file_set_permissions,
+        .file_set_owner,
+        .file_set_timestamps,
+        .dir_set_permissions,
+        .dir_set_owner,
+        .dir_set_file_permissions,
+        .dir_set_file_owner,
+        .dir_set_file_timestamps,
+        .dir_sym_link,
+        .dir_read_link,
+        .dir_hard_link,
+        .dir_access,
+        .dir_read,
+        .dir_real_path,
+        .dir_real_path_file,
+        .file_real_path,
+        .file_hard_link,
+        .device_io_control,
+        => .no,
+        .group,
+        .timer,
+        .async,
+        .work,
+        .net_open,
+        .net_bind,
+        .net_listen,
+        .net_connect,
+        .net_accept,
+        .net_recv,
+        .net_send,
+        .net_recvfrom,
+        .net_sendto,
+        .net_recvmsg,
+        .net_sendmsg,
+        .net_poll,
+        .net_shutdown,
+        .net_close,
+        .net_send_file,
+        .file_open,
+        .file_create,
+        .file_close,
+        .file_read,
+        .file_write,
+        .file_read_streaming,
+        .file_write_streaming,
+        .file_sync,
+        .dir_create_dir,
+        .dir_rename,
+        .dir_rename_preserve,
+        .dir_delete_file,
+        .dir_delete_dir,
+        .file_size,
+        .file_stat,
+        .dir_open,
+        .dir_close,
+        .pipe_poll,
+        .pipe_create,
+        .pipe_close,
+        .mach_port,
+        => .yes,
+    };
+}
+
+const FeatureSupport = enum(u8) {
+    unknown,
+    yes,
+    no,
 };
-
-// Tri-state for the once-probed IORING_OP_FTRUNCATE support. `unknown` is treated
-// as `no` at the dispatch site, so a missed/failed probe is always safe (the
-// thread-pool fallback works on every kernel) — never a rejected SQE.
-const ftruncate_unknown: u8 = 0;
-const ftruncate_yes: u8 = 1;
-const ftruncate_no: u8 = 2;
 
 pub const SharedState = struct {
     master_fd: std.atomic.Value(c_int) = .init(-1),
     refcount: std.atomic.Value(usize) = .init(0),
     /// Whether the running kernel supports IORING_OP_FTRUNCATE (Linux >= 6.9),
-    /// probed exactly once when the master ring is created (see `init`). Read by
-    /// `fileSetSizeSupported()`.
-    ftruncate_support: std.atomic.Value(u8) = .init(ftruncate_unknown),
+    /// probed exactly once when the master ring is created and resolved by
+    /// `supports()` for `.file_set_size`.
+    ftruncate_support: std.atomic.Value(FeatureSupport) = .init(.unknown),
+    /// IORING_OP_WAITID was added after the minimum supported ring setup.
+    waitid_support: std.atomic.Value(FeatureSupport) = .init(.unknown),
+    /// IORING_OP_BIND and IORING_OP_LISTEN arrived together in Linux 6.11, so
+    /// they are probed and gated as one feature. Unlike the two above there is
+    /// no thread-pool fallback — bind/listen never block, so the fallback is
+    /// the direct syscall on the loop thread, decided inside `submit`.
+    bind_listen_support: std.atomic.Value(FeatureSupport) = .init(.unknown),
 };
 
 pub const NetRecvData = struct {
@@ -195,9 +249,47 @@ pub const ProcessWaitData = struct {
     siginfo: linux.siginfo_t = undefined,
 };
 
+/// State of the native sendfile splice chain. The transfer alternates two
+/// hops through an op-owned pipe — splice file -> pipe, then splice pipe ->
+/// socket until the pipe drains — so each CQE advances the machine
+/// (netSendFileAdvance) rather than completing the op. Serial by design: at
+/// most one SQE is in flight per op, and the pipe is fully drained before the
+/// next file read, so a pipe-side EAGAIN is impossible by construction.
+pub const NetSendFileData = struct {
+    /// Intermediary pipe; closed when the op finishes on any path.
+    pipe_fds: [2]fs.fd_t = .{ -1, -1 },
+    /// Which hop the in-flight SQE belongs to.
+    stage: Stage = .to_pipe,
+    /// True while a readiness poll is in flight instead of the stage's splice:
+    /// splice punts to io-wq with no internal poll-retry, so an -EAGAIN CQE
+    /// (non-blocking socket, or a non-regular source file) is bridged by an
+    /// explicit poll SQE and the splice is re-issued when it fires.
+    polling: bool = false,
+    /// File offset of the next file -> pipe splice.
+    offset: u64 = 0,
+    /// Bytes still allowed to be read from the file (the caller's limit).
+    read_remaining: usize = 0,
+    /// Bytes sitting in the pipe, not yet spliced to the socket.
+    in_pipe: usize = 0,
+    /// Set when the file -> pipe splice returned 0 (end of file).
+    eof: bool = false,
+    /// Total bytes delivered to the socket (the operation result).
+    sent: usize = 0,
+
+    pub const Stage = enum { to_pipe, to_socket };
+};
+
+/// "No offset" sentinel for the pipe side of a splice SQE (the kernel treats
+/// ~0 as a null offset pointer).
+const splice_no_offset: u64 = std.math.maxInt(u64);
+
+// splice(2) flags; not defined in std.os.linux.
+const SPLICE_F_MOVE: u32 = 1;
+const SPLICE_F_MORE: u32 = 4;
+
 const Self = @This();
 
-const log = @import("../../common.zig").log;
+const log = @import("../../../common.zig").log;
 
 allocator: std.mem.Allocator,
 ring: linux.IoUring,
@@ -221,6 +313,12 @@ wall_ts: [2]linux.kernel_timespec = undefined,
 /// so there is no aliasing concern.
 cqe_buf: [256]linux.io_uring_cqe = undefined,
 shared_state: *SharedState,
+/// Backend-internal inflight count: ops accepted by submit() and not yet
+/// completed (in the SQ/kernel or parked on `pending`). This backend is
+/// strictly per-loop (submit, poll, and completion on the owner thread), so a
+/// plain counter suffices. Read by hasInflight() to skip the enter syscall
+/// when nothing can arrive.
+inflight: usize = 0,
 
 pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_state: *SharedState) !void {
     var flags: u32 = 0;
@@ -228,25 +326,19 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
     flags |= linux.IORING_SETUP_DEFER_TASKRUN;
     flags |= linux.IORING_SETUP_COOP_TASKRUN;
 
+    const master_fd = shared_state.master_fd.load(.seq_cst);
+    const is_master = master_fd == -1;
     var ring = blk: {
-        const master_fd = shared_state.master_fd.load(.seq_cst);
-        if (master_fd != -1) {
+        if (!is_master) {
             flags |= linux.IORING_SETUP_ATTACH_WQ;
             break :blk try ringFromMasterFd(master_fd, flags, queue_size);
         } else {
             var ring = try linux.IoUring.init(queue_size, flags);
-            // Probe FTRUNCATE support once, on this fresh ring, and publish the
-            // verdict BEFORE master_fd. Any executor that later attaches sees a
-            // non-negative master_fd (seq_cst) and is thus guaranteed to observe
-            // the stored verdict. Racing creators store the same kernel-global
-            // value, so a redundant store by a CAS loser is harmless.
-            probeAndStoreFtruncate(&ring, shared_state);
-            const old_fd = shared_state.master_fd.cmpxchgStrong(-1, ring.fd, .seq_cst, .seq_cst);
-            if (old_fd != null) {
-                ring.deinit();
-                flags |= linux.IORING_SETUP_ATTACH_WQ;
-                break :blk try ringFromMasterFd(old_fd.?, flags, queue_size);
-            }
+            // The Linux facade serializes group initialization, so this first
+            // ring remains private until every fallible initialization step has
+            // succeeded. This prevents a failed eventfd setup from publishing a
+            // stale master fd that later loops would try to attach to.
+            probeAndStoreFeatures(&ring, shared_state);
             break :blk ring;
         }
     };
@@ -255,6 +347,7 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
     const waker_eventfd = try posix.eventfd(0, posix.EFD.CLOEXEC | posix.EFD.NONBLOCK);
     errdefer _ = linux.close(waker_eventfd);
 
+    if (is_master) shared_state.master_fd.store(ring.fd, .seq_cst);
     _ = shared_state.refcount.fetchAdd(1, .seq_cst);
 
     self.* = .{
@@ -271,23 +364,32 @@ pub fn init(self: *Self, allocator: std.mem.Allocator, queue_size: u16, shared_s
     _ = self.armWaker();
 }
 
-/// Probe (once, via IORING_REGISTER_PROBE) whether the kernel knows the
-/// IORING_OP_FTRUNCATE opcode (added in Linux 6.9) and record it in `SharedState`.
-/// A failed probe records "no", so file_set_size takes the always-correct
-/// thread-pool fallback rather than risk a rejected SQE.
-fn probeAndStoreFtruncate(ring: *linux.IoUring, shared_state: *SharedState) void {
-    const supported = blk: {
-        const probe = ring.get_probe() catch break :blk false;
-        break :blk probe.is_supported(.FTRUNCATE);
+/// Probe optional opcodes once. Failure records "no" for every feature so the
+/// Loop takes an always-correct fallback instead of submitting a rejected SQE.
+fn probeAndStoreFeatures(ring: *linux.IoUring, shared_state: *SharedState) void {
+    const probe = ring.get_probe() catch {
+        shared_state.ftruncate_support.store(.no, .monotonic);
+        shared_state.waitid_support.store(.no, .monotonic);
+        shared_state.bind_listen_support.store(.no, .monotonic);
+        return;
     };
-    shared_state.ftruncate_support.store(if (supported) ftruncate_yes else ftruncate_no, .seq_cst);
+    shared_state.ftruncate_support.store(if (probe.is_supported(.FTRUNCATE)) .yes else .no, .monotonic);
+    shared_state.waitid_support.store(if (probe.is_supported(.WAITID)) .yes else .no, .monotonic);
+    shared_state.bind_listen_support.store(
+        if (probe.is_supported(.BIND) and probe.is_supported(.LISTEN)) .yes else .no,
+        .monotonic,
+    );
 }
 
-/// Runtime capability query used by the Loop: may file_set_size use the native
-/// IORING_OP_FTRUNCATE SQE, or must it fall back to the thread pool? Probed once
-/// at ring creation; see `SharedState.ftruncate_support`.
-pub fn fileSetSizeSupported(self: *Self) bool {
-    return self.shared_state.ftruncate_support.load(.seq_cst) == ftruncate_yes;
+pub fn supports(self: *const Self, comptime op: Op, _: *op.toType()) bool {
+    comptime std.debug.assert(capability(op) == .maybe);
+    if (comptime op == .file_set_size) {
+        return self.shared_state.ftruncate_support.load(.monotonic) == .yes;
+    }
+    if (comptime op == .process_wait) {
+        return self.shared_state.waitid_support.load(.monotonic) == .yes;
+    }
+    @compileError("unhandled runtime io_uring capability: " ++ @tagName(op));
 }
 
 fn ringFromMasterFd(master_fd: i32, flags: u32, queue_size: u16) !linux.IoUring {
@@ -323,11 +425,12 @@ pub fn wake(self: *Self, state: *LoopState) void {
 }
 
 /// Arm the multishot poll on the waker eventfd if needed. Returns false only
-/// when a rearm was needed but the SQ was full (caller must not block).
-/// Normally a no-op: the poll is armed once and the kernel keeps it armed.
+/// when a rearm was needed but the ring refused the SQE (caller must not
+/// block). Normally a no-op: the poll is armed once and the kernel keeps it
+/// armed.
 fn armWaker(self: *Self) bool {
     if (!self.waker_needs_rearm) return true;
-    const sqe = self.ring.get_sqe() catch return false;
+    const sqe = self.getSqe() orelse return false;
     sqe.prep_poll_add(self.waker_eventfd, linux.POLL.IN);
     sqe.len = linux.IORING_POLL_ADD_MULTI;
     sqe.user_data = specialUd(.waker, 0);
@@ -343,18 +446,36 @@ fn drainWaker(self: *Self, cqe: linux.io_uring_cqe) void {
     if (cqe.flags & linux.IORING_CQE_F_MORE == 0) self.waker_needs_rearm = true;
 }
 
+/// Drop one inflight op. Called via LoopState.markCompletedFromBackend on the
+/// owner thread.
+pub fn decrInflight(self: *Self) void {
+    self.inflight -= 1;
+}
+
+/// Whether poll() could produce completions. Used by the loop to skip the
+/// wait syscall in no-wait ticks when nothing can arrive.
+pub fn hasInflight(self: *const Self) bool {
+    return self.inflight > 0;
+}
+
 /// Submit a completion to the backend - infallible.
 /// On error, completes the operation immediately with error.Unexpected.
-/// Can be called for initial submission (state == .new) or resubmission after EINTR (state == .running).
 pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
-    const is_new = c.state == .new;
-    if (is_new) {
-        c.state = .running;
-        state.incrActive();
-    } else {
-        std.debug.assert(c.state == .running);
-    }
+    // Counted once per accepted op (sync completers decrement right back via
+    // markCompletedFromBackend); EINTR resubmissions go through resubmit and
+    // stay counted from their first submit.
+    self.inflight += 1;
+    self.submitInner(state, c, true);
+}
 
+fn resubmit(self: *Self, state: *LoopState, c: *Completion) void {
+    std.debug.assert(c.loadState().phase == .running);
+    self.submitInner(state, c, false);
+}
+
+/// `is_new` distinguishes the first submission (allocate op-owned resources)
+/// from an EINTR/SQ-full resubmission (reuse them).
+fn submitInner(self: *Self, state: *LoopState, c: *Completion, is_new: bool) void {
     switch (c.op) {
         .group, .timer, .async, .work => unreachable, // Managed by the loop
 
@@ -374,12 +495,29 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
             state.markCompletedFromBackend(c);
         },
         .net_bind => {
-            common.handleNetBind(c);
-            state.markCompletedFromBackend(c);
+            // IORING_OP_BIND needs Linux >= 6.11 (probed once at master ring
+            // creation); otherwise complete synchronously — bind never blocks.
+            if (self.shared_state.bind_listen_support.load(.monotonic) == .yes) {
+                const data = c.cast(NetBind);
+                const sqe = self.getSqeOrDefer(c) orelse return;
+                sqe.prep_bind(data.handle, data.addr, data.addr_len.*, 0);
+                sqe.user_data = @intFromPtr(c);
+            } else {
+                common.handleNetBind(c);
+                state.markCompletedFromBackend(c);
+            }
         },
         .net_listen => {
-            common.handleNetListen(c);
-            state.markCompletedFromBackend(c);
+            // IORING_OP_LISTEN: same gate as .net_bind above.
+            if (self.shared_state.bind_listen_support.load(.monotonic) == .yes) {
+                const data = c.cast(NetListen);
+                const sqe = self.getSqeOrDefer(c) orelse return;
+                sqe.prep_listen(data.handle, data.backlog, 0);
+                sqe.user_data = @intFromPtr(c);
+            } else {
+                common.handleNetListen(c);
+                state.markCompletedFromBackend(c);
+            }
         },
 
         // Async operations through io_uring
@@ -498,7 +636,7 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
         .net_shutdown => {
             const data = c.cast(NetShutdown);
             const sqe = self.getSqeOrDefer(c) orelse return;
-            sqe.prep_shutdown(data.handle, @intFromEnum(data.how));
+            sqe.prep_shutdown(data.handle, @backingInt(data.how));
             sqe.user_data = @intFromPtr(c);
         },
         .net_close => {
@@ -816,19 +954,162 @@ pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
             sqe.user_data = @intFromPtr(c);
         },
         .device_io_control => unreachable, // Handled via thread pool
-        // Driven by Loop's generic read/write fallback, never reaches the backend.
-        .net_send_file => unreachable,
+        .net_send_file => {
+            const data = c.cast(NetSendFile);
+            if (is_new) {
+                data.internal = .{
+                    .pipe_fds = fs.pipe() catch |err| {
+                        c.setError(switch (err) {
+                            error.ProcessFdQuotaExceeded, error.SystemFdQuotaExceeded => error.SystemResources,
+                            else => error.Unexpected,
+                        });
+                        state.markCompletedFromBackend(c);
+                        return;
+                    },
+                    .offset = data.offset,
+                    .read_remaining = data.remaining,
+                };
+            }
+            // A resubmission (EINTR / full SQ) re-preps the same step.
+            self.netSendFileIssue(c);
+        },
         .mach_port => unreachable,
+    }
+}
+
+/// Prep the SQE for the sendfile chain's current step: one splice hop, or the
+/// readiness poll bridging an -EAGAIN. See NetSendFileData.
+fn netSendFileIssue(self: *Self, c: *Completion) void {
+    const data = c.cast(NetSendFile);
+    const sqe = self.getSqeOrDefer(c) orelse return;
+    if (data.internal.polling) {
+        switch (data.internal.stage) {
+            .to_pipe => sqe.prep_poll_add(data.file, linux.POLL.IN),
+            .to_socket => sqe.prep_poll_add(data.handle, linux.POLL.OUT),
+        }
+    } else switch (data.internal.stage) {
+        .to_pipe => {
+            // The kernel caps each hop at the pipe's free space, so the length
+            // only needs to respect the caller's limit (and the u32 SQE field).
+            const chunk: usize = @min(data.internal.read_remaining, std.math.maxInt(u32));
+            sqe.prep_splice(data.file, data.internal.offset, data.internal.pipe_fds[1], splice_no_offset, chunk);
+            sqe.rw_flags = SPLICE_F_MOVE;
+        },
+        .to_socket => {
+            // splice has no MSG_NOSIGNAL equivalent, but a broken peer is
+            // safe here: the op runs in an io-wq worker, which does not
+            // deliver SIGPIPE to the process — the CQE carries -EPIPE
+            // instead (verified empirically; a *synchronous* splice to the
+            // same socket does raise SIGPIPE).
+            sqe.prep_splice(data.internal.pipe_fds[0], splice_no_offset, data.handle, splice_no_offset, data.internal.in_pipe);
+            // MORE (the MSG_MORE analog) batches segments while further chunks
+            // are known to follow; it must be off for the final drain so the
+            // tail is not held back.
+            sqe.rw_flags = SPLICE_F_MOVE;
+            if (!data.internal.eof and data.internal.read_remaining > 0) sqe.rw_flags |= SPLICE_F_MORE;
+        },
+    }
+    sqe.user_data = @intFromPtr(c);
+}
+
+/// Advance the sendfile chain on a CQE for its in-flight SQE. Issues the next
+/// step, or tears down and completes the op (via the storeResult arm) when the
+/// transfer is done, failed, or canceled.
+fn netSendFileAdvance(self: *Self, state: *LoopState, c: *Completion, res: i32) void {
+    const data = c.cast(NetSendFile);
+
+    // A cancel request can land between steps, and the kernel cancel only
+    // catches the SQE that was in flight when it was submitted — checked
+    // before issuing ANY further SQE (including the -EAGAIN poll bridge below:
+    // a cancel whose target CQE was already generated spends itself on
+    // -ENOENT, and a poll armed after that would never be canceled, hanging
+    // the op on a stalled socket forever).
+    if (c.loadState().cancel_requested) {
+        self.storeResult(c, -@as(i32, @backingInt(linux.E.CANCELED)));
+        state.markCompletedFromBackend(c);
+        return;
+    }
+
+    if (res < 0) {
+        const errno: linux.E = @fromBackingInt(@intCast(-res));
+        if (errno == .AGAIN and !data.internal.polling) {
+            data.internal.polling = true;
+            self.netSendFileIssue(c);
+            return;
+        }
+        self.storeResult(c, res);
+        state.markCompletedFromBackend(c);
+        return;
+    }
+
+    if (data.internal.polling) {
+        // Readiness poll fired; retry the stage's splice.
+        data.internal.polling = false;
+        self.netSendFileIssue(c);
+        return;
+    }
+
+    const n: usize = @intCast(res);
+    switch (data.internal.stage) {
+        .to_pipe => {
+            if (n == 0) {
+                data.internal.eof = true;
+            } else {
+                data.internal.offset += n;
+                data.internal.read_remaining -= n;
+                data.internal.in_pipe += n;
+            }
+            if (data.internal.in_pipe > 0) {
+                data.internal.stage = .to_socket;
+                self.netSendFileIssue(c);
+            } else {
+                // EOF (or a zero-byte request) with nothing buffered: done.
+                self.storeResult(c, 0);
+                state.markCompletedFromBackend(c);
+            }
+        },
+        .to_socket => {
+            if (n == 0) {
+                // Cannot happen (the pipe holds in_pipe > 0 bytes); bail out
+                // rather than re-splice forever.
+                self.netSendFileCleanup(c);
+                c.setError(error.Unexpected);
+                state.markCompletedFromBackend(c);
+                return;
+            }
+            data.internal.in_pipe -= n;
+            data.internal.sent += n;
+            if (data.internal.in_pipe > 0) {
+                self.netSendFileIssue(c);
+            } else if (!data.internal.eof and data.internal.read_remaining > 0) {
+                data.internal.stage = .to_pipe;
+                self.netSendFileIssue(c);
+            } else {
+                self.storeResult(c, 0);
+                state.markCompletedFromBackend(c);
+            }
+        },
+    }
+}
+
+/// Close the op-owned pipe (idempotent).
+fn netSendFileCleanup(self: *Self, c: *Completion) void {
+    _ = self;
+    const data = c.cast(NetSendFile);
+    for (&data.internal.pipe_fds) |*fd| {
+        if (fd.* != -1) {
+            fs.close(fd.*) catch {};
+            fd.* = -1;
+        }
     }
 }
 
 /// Cancel a completion - infallible.
 /// Note: target.canceled is already set by loop.add() or loop.cancel() before this is called.
 pub fn cancel(self: *Self, _: *LoopState, target: *Completion) void {
-    switch (target.state) {
+    switch (target.loadState().phase) {
         .new => {
-            // UNREACHABLE: When cancel is added via loop.add() and target.state == .new,
-            // loop.add() handles it directly and doesn't call backend.cancel().
+            // UNREACHABLE: cancelLocal only forwards running completions.
             unreachable;
         },
         .running => {
@@ -840,9 +1121,14 @@ pub fn cancel(self: *Self, _: *LoopState, target: *Completion) void {
             // In poll(), we:
             // - Skip cancel CQEs with user_data=USER_DATA_CANCEL
             // - Process target CQE and mark target complete with error.Canceled (or natural result)
-            const sqe = self.ring.get_sqe() catch {
-                log.err("Failed to get io_uring SQE for cancel", .{});
-                // Cancel SQE failed - do nothing, let target complete naturally
+            // A dropped cancel is not benign: a cancel is submitted precisely
+            // because the target is not expected to complete on its own (e.g.
+            // a recv on a silent peer whose timeout just fired), so dropping
+            // it leaves the completion running and the awaiting task blocked
+            // forever. getSqe() flushes a full SQ and retries, so this only
+            // fails if the kernel refuses submissions outright.
+            const sqe = self.getSqe() orelse {
+                log.err("dropping cancel SQE, kernel refused submission; target may never complete", .{});
                 return;
             };
             sqe.prep_cancel(@intFromPtr(target), 0);
@@ -856,10 +1142,29 @@ pub fn cancel(self: *Self, _: *LoopState, target: *Completion) void {
     }
 }
 
-/// Get an SQE or defer the completion to the pending list if the SQ is full.
-/// Returns null if deferred (caller should return immediately).
+/// Get an SQE, flushing the submission queue to the kernel if it is full.
+/// A full SQ consists entirely of entries the kernel has not been told about
+/// yet, so one non-blocking submit frees the whole ring and the retry
+/// succeeds. The flush is retried on signal interruption. Returns null only
+/// if the kernel refuses submissions outright (e.g. CQ overcommit); every
+/// caller needs a fallback for that case.
+fn getSqe(self: *Self) ?*linux.io_uring_sqe {
+    if (self.ring.get_sqe()) |sqe| return sqe else |_| {}
+    while (true) {
+        _ = self.ring.submit() catch |err| switch (err) {
+            error.SignalInterrupt => continue,
+            else => return null,
+        };
+        break;
+    }
+    return self.ring.get_sqe() catch null;
+}
+
+/// Get an SQE or defer the completion to the pending list if the ring will
+/// not accept one even after a flush. Returns null if deferred (caller should
+/// return immediately).
 fn getSqeOrDefer(self: *Self, c: *Completion) ?*linux.io_uring_sqe {
-    return self.ring.get_sqe() catch {
+    return self.getSqe() orelse {
         self.pending.push(c);
         return null;
     };
@@ -880,16 +1185,17 @@ pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {
 
     // Remove the existing timeout (if any) before re-arming. The removed
     // timeout's CQE and the remove op's CQE are both ignored in poll(). If the
-    // SQ is full, leave wall_armed unchanged (old timeout stays valid) and
-    // report failure so the loop folds this clock into the capped poll timeout.
+    // ring refuses the SQE, leave wall_armed unchanged (old timeout stays
+    // valid) and report failure so the loop folds this clock into the capped
+    // poll timeout.
     if (self.wall_armed[idx] != null) {
-        const sqe = self.ring.get_sqe() catch return false;
+        const sqe = self.getSqe() orelse return false;
         sqe.prep_timeout_remove(specialUd(wallKind(idx), self.wall_generation[idx]), 0);
         sqe.user_data = specialUd(.cancel, 0);
     }
 
     if (deadline) |d| {
-        const sqe = self.ring.get_sqe() catch {
+        const sqe = self.getSqe() orelse {
             // Remove was queued but we can't arm the new timeout now. Forget it
             // (the next scan re-arms) and report failure so the loop folds.
             self.wall_armed[idx] = null;
@@ -909,7 +1215,7 @@ pub fn syncWallTimer(self: *Self, clock: Clock, deadline: ?u64) bool {
 }
 
 pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
-    const linux_os = @import("../../os/linux.zig");
+    const linux_os = @import("../../../os/linux.zig");
 
     // The waker poll is normally already armed (a no-op here). It only needs
     // re-arming in the rare case the kernel dropped the multishot; if the SQ is
@@ -968,7 +1274,7 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
                 // (from re-arming) is ignored.
                 .wall_boot, .wall_real => {
                     const idx: usize = if (udKind(cqe.user_data) == .wall_boot) 0 else 1;
-                    if (cqe.res == -@as(i32, @intFromEnum(linux.E.TIME)) and
+                    if (cqe.res == -@as(i32, @backingInt(linux.E.TIME)) and
                         udGeneration(cqe.user_data) == self.wall_generation[idx] and
                         self.wall_armed[idx] != null)
                     {
@@ -987,14 +1293,21 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
         // When a target is canceled, it recursively completes the cancel operation
         // So when we get the cancel's CQE, it's already completed
         // Similarly, when we get the target's CQE after the cancel already completed it
-        if (completion.state == .completed or completion.state == .dead) {
+        if (completion.loadState().phase != .running) {
             continue;
         }
 
         // Handle EINTR by deferring to pending — resubmit after armWaker so the
         // waker always gets priority over EINTR resubmissions.
-        if (cqe.res == -@as(i32, @intFromEnum(linux.E.INTR))) {
+        if (cqe.res == -@as(i32, @backingInt(linux.E.INTR))) {
             self.pending.push(completion);
+            continue;
+        }
+
+        // Multi-step sendfile: a CQE advances the splice chain rather than
+        // completing the op.
+        if (completion.op == .net_send_file) {
+            self.netSendFileAdvance(state, completion, cqe.res);
             continue;
         }
 
@@ -1019,15 +1332,15 @@ fn drainPending(self: *Self, state: *LoopState) void {
     self.pending = .{};
 
     while (to_drain.pop()) |c| {
-        if (c.cancel_state.load(.acquire).requested) {
+        if (c.loadState().cancel_requested) {
             // Complete canceled pending ops immediately rather than writing a SQE.
             // storeResult handles resource cleanup (e.g. allocated paths).
-            self.storeResult(c, -@as(i32, @intFromEnum(linux.E.CANCELED)));
+            self.storeResult(c, -@as(i32, @backingInt(linux.E.CANCELED)));
             state.markCompletedFromBackend(c);
         } else {
-            // submit() will call getSqeOrDefer(); if the SQ fills up again the
+            // resubmit() will call getSqeOrDefer(); if the SQ fills up again the
             // completion lands in self.pending and will be retried next poll.
-            self.submit(state, c);
+            self.resubmit(state, c);
         }
     }
 }
@@ -1036,8 +1349,28 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
     switch (c.op) {
         .group, .timer, .async, .work => unreachable,
         .net_open => unreachable,
-        .net_bind => unreachable,
-        .net_listen => unreachable,
+        .net_bind => {
+            if (res < 0) {
+                c.setError(net.errnoToBindError(@fromBackingInt(@intCast(-res))));
+            } else {
+                const data = c.cast(NetBind);
+                // IORING_OP_BIND does not report the bound address, so fetch
+                // it here — callers rely on seeing the actual port after
+                // binding port 0 (mirrors handleNetBind).
+                if (net.getsockname(data.handle, data.addr, data.addr_len)) |_| {
+                    c.setResult(.net_bind, {});
+                } else |err| {
+                    c.setError(err);
+                }
+            }
+        },
+        .net_listen => {
+            if (res < 0) {
+                c.setError(net.errnoToListenError(@fromBackingInt(@intCast(-res))));
+            } else {
+                c.setResult(.net_listen, {});
+            }
+        },
         .dir_set_permissions => unreachable, // Handled synchronously
         .dir_set_owner => unreachable, // Handled synchronously
         .dir_set_file_permissions => unreachable, // Handled synchronously
@@ -1055,35 +1388,35 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .net_connect => {
             if (res < 0) {
-                c.setError(net.errnoToConnectError(@enumFromInt(-res)));
+                c.setError(net.errnoToConnectError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_connect, {});
             }
         },
         .net_accept => {
             if (res < 0) {
-                c.setError(net.errnoToAcceptError(@enumFromInt(-res)));
+                c.setError(net.errnoToAcceptError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_accept, @as(net.fd_t, @intCast(res)));
             }
         },
         .net_recv => {
             if (res < 0) {
-                c.setError(net.errnoToRecvError(@enumFromInt(-res)));
+                c.setError(net.errnoToRecvError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_recv, @as(usize, @intCast(res)));
             }
         },
         .net_send => {
             if (res < 0) {
-                c.setError(net.errnoToSendError(@enumFromInt(-res)));
+                c.setError(net.errnoToSendError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_send, @as(usize, @intCast(res)));
             }
         },
         .net_recvfrom => {
             if (res < 0) {
-                c.setError(net.errnoToRecvError(@enumFromInt(-res)));
+                c.setError(net.errnoToRecvError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_recvfrom, @as(usize, @intCast(res)));
                 // Propagate the peer address length filled in by the kernel
@@ -1095,14 +1428,14 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
         },
         .net_sendto => {
             if (res < 0) {
-                c.setError(net.errnoToSendError(@enumFromInt(-res)));
+                c.setError(net.errnoToSendError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_sendto, @as(usize, @intCast(res)));
             }
         },
         .net_recvmsg => {
             if (res < 0) {
-                c.setError(net.errnoToRecvError(@enumFromInt(-res)));
+                c.setError(net.errnoToRecvError(@fromBackingInt(@intCast(-res))));
             } else {
                 const data = c.cast(NetRecvMsg);
                 c.setResult(.net_recvmsg, .{
@@ -1118,14 +1451,14 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
         },
         .net_sendmsg => {
             if (res < 0) {
-                c.setError(net.errnoToSendError(@enumFromInt(-res)));
+                c.setError(net.errnoToSendError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_sendmsg, @as(usize, @intCast(res)));
             }
         },
         .net_poll => {
             if (res < 0) {
-                c.setError(net.errnoToRecvError(@enumFromInt(-res)));
+                c.setError(net.errnoToRecvError(@fromBackingInt(@intCast(-res))));
             } else {
                 // Poll succeeded - requested events are ready
                 c.setResult(.net_poll, {});
@@ -1133,7 +1466,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
         },
         .net_shutdown => {
             if (res < 0) {
-                c.setError(net.errnoToShutdownError(@enumFromInt(-res)));
+                c.setError(net.errnoToShutdownError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.net_shutdown, {});
             }
@@ -1148,7 +1481,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             const data = c.cast(FileOpen);
             self.allocator.free(data.internal.path);
             if (res < 0) {
-                c.setError(fs.errnoToFileOpenError(@enumFromInt(-res), data.flags));
+                c.setError(fs.errnoToFileOpenError(@fromBackingInt(@intCast(-res)), data.flags));
             } else {
                 c.setResult(.file_open, .{ .fd = res });
             }
@@ -1158,7 +1491,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             const data = c.cast(FileCreate);
             self.allocator.free(data.internal.path);
             if (res < 0) {
-                c.setError(fs.errnoToFileOpenError(@enumFromInt(-res), data.flags));
+                c.setError(fs.errnoToFileOpenError(@fromBackingInt(@intCast(-res)), data.flags));
             } else {
                 c.setResult(.file_create, .{ .fd = res });
             }
@@ -1166,7 +1499,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .file_close => {
             if (res < 0) {
-                c.setError(fs.errnoToFileCloseError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileCloseError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_close, {});
             }
@@ -1174,7 +1507,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .file_read => {
             if (res < 0) {
-                c.setError(fs.errnoToFileReadError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileReadError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_read, @intCast(res));
             }
@@ -1182,7 +1515,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .file_write => {
             if (res < 0) {
-                c.setError(fs.errnoToFileWriteError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileWriteError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_write, @intCast(res));
             }
@@ -1190,7 +1523,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .file_read_streaming => {
             if (res < 0) {
-                c.setError(fs.errnoToFileReadError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileReadError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_read_streaming, @intCast(res));
             }
@@ -1198,7 +1531,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .file_write_streaming => {
             if (res < 0) {
-                c.setError(fs.errnoToFileWriteError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileWriteError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_write_streaming, @intCast(res));
             }
@@ -1206,7 +1539,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .file_sync => {
             if (res < 0) {
-                c.setError(fs.errnoToFileSyncError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileSyncError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_sync, {});
             }
@@ -1214,7 +1547,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .file_set_size => {
             if (res < 0) {
-                c.setError(fs.errnoToFileSetSizeError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileSetSizeError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_set_size, {});
             }
@@ -1228,7 +1561,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             const data = c.cast(DirCreateDir);
             self.allocator.free(data.internal.path);
             if (res < 0) {
-                c.setError(fs.errnoToDirCreateDirError(@enumFromInt(-res)));
+                c.setError(fs.errnoToDirCreateDirError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.dir_create_dir, {});
             }
@@ -1239,7 +1572,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             self.allocator.free(data.internal.old_path);
             self.allocator.free(data.internal.new_path);
             if (res < 0) {
-                c.setError(fs.errnoToDirRenameError(@enumFromInt(-res)));
+                c.setError(fs.errnoToDirRenameError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.dir_rename, {});
             }
@@ -1250,7 +1583,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             self.allocator.free(data.internal.old_path);
             self.allocator.free(data.internal.new_path);
             if (res < 0) {
-                const errno: linux.E = @enumFromInt(-res);
+                const errno: linux.E = @fromBackingInt(@intCast(-res));
                 if (errno == .EXIST) {
                     c.setError(error.PathAlreadyExists);
                 } else {
@@ -1265,7 +1598,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             const data = c.cast(DirDeleteFile);
             self.allocator.free(data.internal.path);
             if (res < 0) {
-                c.setError(fs.errnoToDirDeleteFileError(@enumFromInt(-res)));
+                c.setError(fs.errnoToDirDeleteFileError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.dir_delete_file, {});
             }
@@ -1275,7 +1608,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             const data = c.cast(DirDeleteDir);
             self.allocator.free(data.internal.path);
             if (res < 0) {
-                c.setError(fs.errnoToDirDeleteDirError(@enumFromInt(-res)));
+                c.setError(fs.errnoToDirDeleteDirError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.dir_delete_dir, {});
             }
@@ -1284,7 +1617,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
         .file_size => {
             const data = c.cast(FileSize);
             if (res < 0) {
-                c.setError(fs.errnoToFileSizeError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileSizeError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_size, data.internal.statx.size);
             }
@@ -1297,7 +1630,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
                 self.allocator.free(data.internal.path);
             }
             if (res < 0) {
-                c.setError(fs.errnoToFileStatError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileStatError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.file_stat, statxToFileStat(data.internal.statx));
             }
@@ -1307,7 +1640,7 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             const data = c.cast(DirOpen);
             self.allocator.free(data.internal.path);
             if (res < 0) {
-                c.setError(fs.errnoToDirOpenError(@enumFromInt(-res), data.flags));
+                c.setError(fs.errnoToDirOpenError(@fromBackingInt(@intCast(-res)), data.flags));
             } else {
                 c.setResult(.dir_open, res);
             }
@@ -1315,14 +1648,14 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
 
         .dir_close => {
             if (res < 0) {
-                c.setError(fs.errnoToFileCloseError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileCloseError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.dir_close, {});
             }
         },
         .pipe_poll => {
             if (res < 0) {
-                c.setError(fs.errnoToFileReadError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileReadError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.pipe_poll, {});
             }
@@ -1330,14 +1663,14 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
         .pipe_create => unreachable, // Handled synchronously
         .pipe_close => {
             if (res < 0) {
-                c.setError(fs.errnoToFileCloseError(@enumFromInt(-res)));
+                c.setError(fs.errnoToFileCloseError(@fromBackingInt(@intCast(-res))));
             } else {
                 c.setResult(.pipe_close, {});
             }
         },
         .process_wait => {
             if (res < 0) {
-                const err: linux.E = @enumFromInt(-res);
+                const err: linux.E = @fromBackingInt(@intCast(-res));
                 switch (err) {
                     .CHILD => c.setError(error.ProcessNotFound),
                     else => c.setError(error.Unexpected),
@@ -1359,8 +1692,24 @@ fn storeResult(self: *Self, c: *Completion, res: i32) void {
             }
         },
         .device_io_control => unreachable, // Handled via thread pool
-        // Driven by Loop's generic read/write fallback, never reaches the backend.
-        .net_send_file => unreachable,
+        .net_send_file => {
+            // Terminal result for the splice chain: reached from
+            // netSendFileAdvance (done / failed / canceled between steps) and
+            // from drainPending's cancel path while parked on `pending`.
+            // Mid-chain CQEs never get here — poll() routes them to
+            // netSendFileAdvance.
+            const data = c.cast(NetSendFile);
+            self.netSendFileCleanup(c);
+            if (res < 0) {
+                const errno: linux.E = @fromBackingInt(@intCast(-res));
+                c.setError(switch (data.internal.stage) {
+                    .to_pipe => fs.errnoToFileReadError(errno),
+                    .to_socket => net.errnoToSendError(errno),
+                });
+            } else {
+                c.setResult(.net_send_file, data.internal.sent);
+            }
+        },
         .mach_port => unreachable,
     }
 }

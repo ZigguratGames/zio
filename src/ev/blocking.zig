@@ -44,8 +44,9 @@ const time = @import("../time.zig");
 /// Supports file, pipe, and socket operations (read/write use poll+I/O on POSIX).
 /// Timer and async/work/group operations are not supported (require event loop).
 pub fn executeBlocking(c: *Completion, allocator: std.mem.Allocator) void {
-    // Mark completion as having no loop
-    c.loop = null;
+    // Reset the completion: no loop, fresh state
+    c.setLoop(null);
+    c.state.store(.{}, .monotonic);
 
     switch (c.op) {
         .file_open => common.handleFileOpen(c, allocator),
@@ -132,10 +133,10 @@ pub fn executeBlocking(c: *Completion, allocator: std.mem.Allocator) void {
 ///
 /// Only gather groups whose children are all individually supported in blocking
 /// mode are handled. Today that means close batches (see `io.fileCloseImpl` /
-/// `io.netCloseImpl`), which the panic/crash path exercises when std's stack-trace
-/// symbolization opens and then closes the executable through `debug_io`. Anything
-/// else keeps the "requires event loop" panic. Children are validated before any is
-/// run so we never leave a group half-executed.
+/// `io.netCloseImpl` / `io.dirCloseImpl`), which the panic/crash path exercises when
+/// std's stack-trace symbolization opens and then closes the executable through
+/// `debug_io`. Anything else keeps the "requires event loop" panic. Children are
+/// validated before any is run so we never leave a group half-executed.
 fn handleBlockingGroup(c: *Completion, allocator: std.mem.Allocator) void {
     const group: *Group = @alignCast(@fieldParentPtr("c", c));
 
@@ -149,7 +150,7 @@ fn handleBlockingGroup(c: *Completion, allocator: std.mem.Allocator) void {
     while (node) |n| : (node = n.next) {
         const child: *Completion = @alignCast(@fieldParentPtr("group", n));
         switch (child.op) {
-            .file_close, .net_close => {},
+            .file_close, .net_close, .dir_close => {},
             else => @panic("Group contains an operation not supported in blocking mode"),
         }
     }
@@ -270,17 +271,9 @@ fn handleNetShutdown(c: *Completion) void {
 fn handleNetRecv(c: *Completion) void {
     const data = c.cast(NetRecv);
 
-    // Windows: blocking recv, no poll needed
-    if (builtin.os.tag == .windows) {
-        if (os.net.recv(data.handle, data.buffers.iovecs, data.flags)) |bytes_read| {
-            c.setResult(.net_recv, bytes_read);
-        } else |err| {
-            c.setError(err);
-        }
-        return;
-    }
-
-    // POSIX: poll+recv loop to handle race if multiple threads access same socket
+    // Poll+recv loop: the socket may be nonblocking (NetAccept hands out
+    // nonblocking sockets by default), and multiple threads may race on the
+    // same socket; poll readiness and retry on WouldBlock either way.
     while (true) {
         pollForReady(data.handle, os.net.POLL.IN) catch |err| {
             c.setError(err);
@@ -304,17 +297,7 @@ fn handleNetRecv(c: *Completion) void {
 fn handleNetSend(c: *Completion) void {
     const data = c.cast(NetSend);
 
-    // Windows: blocking send, no poll needed
-    if (builtin.os.tag == .windows) {
-        if (os.net.send(data.handle, data.buffer.iovecs, data.flags)) |bytes_written| {
-            c.setResult(.net_send, bytes_written);
-        } else |err| {
-            c.setError(err);
-        }
-        return;
-    }
-
-    // POSIX: poll+send loop to handle race if multiple threads access same socket
+    // Poll+send loop; see handleNetRecv for why polling is unconditional.
     while (true) {
         pollForReady(data.handle, os.net.POLL.OUT) catch |err| {
             c.setError(err);
@@ -338,17 +321,7 @@ fn handleNetSend(c: *Completion) void {
 fn handleNetRecvFrom(c: *Completion) void {
     const data = c.cast(NetRecvFrom);
 
-    // Windows: blocking recvfrom, no poll needed
-    if (builtin.os.tag == .windows) {
-        if (os.net.recvfrom(data.handle, data.buffer.iovecs, data.flags, data.addr, data.addr_len)) |bytes_read| {
-            c.setResult(.net_recvfrom, bytes_read);
-        } else |err| {
-            c.setError(err);
-        }
-        return;
-    }
-
-    // POSIX: poll+recvfrom loop to handle race if multiple threads access same socket
+    // Poll+recvfrom loop; see handleNetRecv for why polling is unconditional.
     while (true) {
         pollForReady(data.handle, os.net.POLL.IN) catch |err| {
             c.setError(err);
@@ -372,17 +345,7 @@ fn handleNetRecvFrom(c: *Completion) void {
 fn handleNetSendTo(c: *Completion) void {
     const data = c.cast(NetSendTo);
 
-    // Windows: blocking sendto, no poll needed
-    if (builtin.os.tag == .windows) {
-        if (os.net.sendto(data.handle, data.buffer.iovecs, data.flags, data.addr, data.addr_len)) |bytes_written| {
-            c.setResult(.net_sendto, bytes_written);
-        } else |err| {
-            c.setError(err);
-        }
-        return;
-    }
-
-    // POSIX: poll+sendto loop to handle race if multiple threads access same socket
+    // Poll+sendto loop; see handleNetRecv for why polling is unconditional.
     while (true) {
         pollForReady(data.handle, os.net.POLL.OUT) catch |err| {
             c.setError(err);
@@ -406,17 +369,7 @@ fn handleNetSendTo(c: *Completion) void {
 fn handleNetRecvMsg(c: *Completion) void {
     const data = c.cast(NetRecvMsg);
 
-    // Windows: blocking recvmsg (emulated in net layer), no poll needed
-    if (builtin.os.tag == .windows) {
-        if (os.net.recvmsg(data.handle, data.data.iovecs, data.flags, data.addr, data.addr_len, data.control)) |result| {
-            c.setResult(.net_recvmsg, result);
-        } else |err| {
-            c.setError(err);
-        }
-        return;
-    }
-
-    // POSIX: poll+recvmsg loop to handle race if multiple threads access same socket
+    // Poll+recvmsg loop; see handleNetRecv for why polling is unconditional.
     while (true) {
         pollForReady(data.handle, os.net.POLL.IN) catch |err| {
             c.setError(err);
@@ -440,17 +393,7 @@ fn handleNetRecvMsg(c: *Completion) void {
 fn handleNetSendMsg(c: *Completion) void {
     const data = c.cast(NetSendMsg);
 
-    // Windows: blocking sendmsg (emulated in net layer), no poll needed
-    if (builtin.os.tag == .windows) {
-        if (os.net.sendmsg(data.handle, data.data.iovecs, data.flags, data.addr, data.addr_len, data.control)) |bytes_written| {
-            c.setResult(.net_sendmsg, bytes_written);
-        } else |err| {
-            c.setError(err);
-        }
-        return;
-    }
-
-    // POSIX: poll+sendmsg loop to handle race if multiple threads access same socket
+    // Poll+sendmsg loop; see handleNetRecv for why polling is unconditional.
     while (true) {
         pollForReady(data.handle, os.net.POLL.OUT) catch |err| {
             c.setError(err);
@@ -501,7 +444,7 @@ fn handleNetConnect(c: *Completion) void {
             if (sock_err == 0) {
                 c.setResult(.net_connect, {});
             } else {
-                c.setError(os.net.errnoToConnectError(@enumFromInt(sock_err)));
+                c.setError(os.net.errnoToConnectError(@fromBackingInt(@intCast(sock_err))));
             }
         },
         else => c.setError(err),
@@ -512,17 +455,7 @@ fn handleNetConnect(c: *Completion) void {
 fn handleNetAccept(c: *Completion) void {
     const data = c.cast(NetAccept);
 
-    // Windows: blocking accept, no poll needed
-    if (builtin.os.tag == .windows) {
-        if (os.net.accept(data.handle, data.addr, data.addr_len, data.flags)) |new_handle| {
-            c.setResult(.net_accept, new_handle);
-        } else |err| {
-            c.setError(err);
-        }
-        return;
-    }
-
-    // POSIX: poll+accept loop to handle race if multiple threads access same socket
+    // Poll+accept loop; see handleNetRecv for why polling is unconditional.
     while (true) {
         pollForReady(data.handle, os.net.POLL.IN) catch |err| {
             c.setError(err);

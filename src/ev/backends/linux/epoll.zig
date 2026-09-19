@@ -1,54 +1,121 @@
 const std = @import("std");
-const posix = @import("../../os/posix.zig");
-const net = @import("../../os/net.zig");
-const time = @import("../../os/time.zig");
-const Duration = @import("../../time.zig").Duration;
-const Clock = @import("../../time.zig").Clock;
-const common = @import("common.zig");
+const posix = @import("../../../os/posix.zig");
+const net = @import("../../../os/net.zig");
+const time = @import("../../../os/time.zig");
+const Duration = @import("../../../time.zig").Duration;
+const Clock = @import("../../../time.zig").Clock;
+const common = @import("../common.zig");
 
-const unexpectedError = @import("../../os/base.zig").unexpectedError;
-const LoopState = @import("../loop.zig").LoopState;
-const Completion = @import("../completion.zig").Completion;
-const Op = @import("../completion.zig").Op;
-const Queue = @import("../queue.zig").Queue;
-const NetConnect = @import("../completion.zig").NetConnect;
-const NetAccept = @import("../completion.zig").NetAccept;
-const NetRecv = @import("../completion.zig").NetRecv;
-const NetSend = @import("../completion.zig").NetSend;
-const NetRecvFrom = @import("../completion.zig").NetRecvFrom;
-const NetSendTo = @import("../completion.zig").NetSendTo;
-const NetRecvMsg = @import("../completion.zig").NetRecvMsg;
-const NetSendMsg = @import("../completion.zig").NetSendMsg;
-const NetPoll = @import("../completion.zig").NetPoll;
-const NetClose = @import("../completion.zig").NetClose;
-const PipePoll = @import("../completion.zig").PipePoll;
-const PipeClose = @import("../completion.zig").PipeClose;
-const ProcessWait = @import("../completion.zig").ProcessWait;
-const fs = @import("../../os/fs.zig");
+const unexpectedError = @import("../../../os/base.zig").unexpectedError;
+const LoopState = @import("../../loop.zig").LoopState;
+const Completion = @import("../../completion.zig").Completion;
+const Op = @import("../../completion.zig").Op;
+const Queue = @import("../../queue.zig").Queue;
+const NetConnect = @import("../../completion.zig").NetConnect;
+const NetAccept = @import("../../completion.zig").NetAccept;
+const NetRecv = @import("../../completion.zig").NetRecv;
+const NetSend = @import("../../completion.zig").NetSend;
+const NetRecvFrom = @import("../../completion.zig").NetRecvFrom;
+const NetSendTo = @import("../../completion.zig").NetSendTo;
+const NetRecvMsg = @import("../../completion.zig").NetRecvMsg;
+const NetSendMsg = @import("../../completion.zig").NetSendMsg;
+const NetPoll = @import("../../completion.zig").NetPoll;
+const NetClose = @import("../../completion.zig").NetClose;
+const PipePoll = @import("../../completion.zig").PipePoll;
+const PipeClose = @import("../../completion.zig").PipeClose;
+const ProcessWait = @import("../../completion.zig").ProcessWait;
+const fs = @import("../../../os/fs.zig");
 const linux = std.os.linux;
-const os_linux = @import("../../os/linux.zig");
-const sockreg = @import("../sockreg.zig");
+const os_linux = @import("../../../os/linux.zig");
+const sockreg = @import("../../sockreg.zig");
 
 pub const NetHandle = net.fd_t;
 
-const BackendCapabilities = @import("../completion.zig").BackendCapabilities;
+const Support = @import("../../completion.zig").Support;
 
-pub const capabilities: BackendCapabilities = .{
-    .process_wait = true,
-    .native_wall_timers = true,
-    // A socket fd is registered in exactly one loop's epoll (per direction), but
-    // the op can be submitted from another loop and is serviced/completed by the
-    // registering loop when its edge fires - i.e. completions finish on a thread
-    // other than the one that submitted them. That makes the group's
-    // active/inflight accounting shared, exactly like IOCP.
-    .is_multi_threaded = true,
-};
+pub const native_wall_timers = true;
+pub const supports_nonblocking_file_io = false;
+
+pub fn capability(comptime op: Op) Support {
+    return switch (op) {
+        .file_read_streaming, .file_write_streaming => .maybe,
+        .net_send_file,
+        .file_open,
+        .file_create,
+        .file_close,
+        .file_read,
+        .file_write,
+        .file_sync,
+        .file_set_size,
+        .file_set_permissions,
+        .file_set_owner,
+        .file_set_timestamps,
+        .dir_create_dir,
+        .dir_rename,
+        .dir_rename_preserve,
+        .dir_delete_file,
+        .dir_delete_dir,
+        .file_size,
+        .file_stat,
+        .dir_open,
+        .dir_close,
+        .dir_set_permissions,
+        .dir_set_owner,
+        .dir_set_file_permissions,
+        .dir_set_file_owner,
+        .dir_set_file_timestamps,
+        .dir_sym_link,
+        .dir_read_link,
+        .dir_hard_link,
+        .dir_access,
+        .dir_read,
+        .dir_real_path,
+        .dir_real_path_file,
+        .file_real_path,
+        .file_hard_link,
+        .device_io_control,
+        => .no,
+        .group,
+        .timer,
+        .async,
+        .work,
+        .net_open,
+        .net_bind,
+        .net_listen,
+        .net_connect,
+        .net_accept,
+        .net_recv,
+        .net_send,
+        .net_recvfrom,
+        .net_sendto,
+        .net_recvmsg,
+        .net_sendmsg,
+        .net_poll,
+        .net_shutdown,
+        .net_close,
+        .pipe_poll,
+        .pipe_create,
+        .pipe_close,
+        .mach_port,
+        .process_wait,
+        => .yes,
+    };
+}
+
+pub fn supports(_: *const Self, comptime op: Op, data: *op.toType()) bool {
+    comptime std.debug.assert(capability(op) == .maybe);
+    if (comptime op == .file_read_streaming or op == .file_write_streaming) {
+        return common.resolveStreamingSupport(data);
+    }
+    @compileError("unhandled runtime epoll capability: " ++ @tagName(op));
+}
 
 pub const SharedState = struct {
-    /// Group-shared accounting: a completion submitted on one loop may be
-    /// finished by the loop that owns the fd registration, so active/inflight_io
-    /// are shared atomics rather than per-LoopState fields (see LoopState).
-    active: std.atomic.Value(usize) = .init(0),
+    /// Backend-internal inflight count: ops accepted by submit() and not yet
+    /// completed. A completion submitted on one loop may be finished by the
+    /// loop that owns the fd registration, so the count is a group-shared
+    /// atomic (either loop's decrInflight hits the same storage). Read by
+    /// hasInflight() to skip the poll syscall when nothing can arrive.
     inflight_io: std.atomic.Value(usize) = .init(0),
     /// Cross-loop single-owner socket registration table, shared by every loop
     /// in the group. See sockreg.zig.
@@ -110,7 +177,7 @@ const PollEntry = struct {
 
 const Self = @This();
 
-const log = @import("../../common.zig").log;
+const log = @import("../../../common.zig").log;
 
 allocator: std.mem.Allocator,
 poll_queue: std.AutoHashMapUnmanaged(NetHandle, PollEntry) = .empty,
@@ -484,11 +551,26 @@ pub fn probeEvent(fd: NetHandle, dir: sockreg.Dir) linux.epoll_event {
     return .{ .data = .{ .u64 = sockData(fd) }, .events = 0 };
 }
 
+/// Drop one inflight op. Called via LoopState.markCompletedFromBackend from
+/// whichever loop finishes the op; the storage is group-shared, so any
+/// instance's decrement balances any instance's increment.
+pub fn decrInflight(self: *Self) void {
+    _ = self.shared.inflight_io.fetchSub(1, .monotonic);
+}
+
+/// Whether poll() could produce completions. Used by the loop to skip the
+/// wait syscall in no-wait ticks when nothing can arrive.
+pub fn hasInflight(self: *const Self) bool {
+    return self.shared.inflight_io.load(.monotonic) > 0;
+}
+
 /// Submit a completion to the backend - infallible.
 /// On error, completes the operation immediately with error.Unexpected.
 pub fn submit(self: *Self, state: *LoopState, c: *Completion) void {
-    c.state = .running;
-    state.incrActive();
+    // Counted for every accepted op (sync completers decrement right back via
+    // markCompletedFromBackend), mirroring the decrInflight in every completion
+    // path so the balance needs no per-path reasoning.
+    _ = self.shared.inflight_io.fetchAdd(1, .monotonic);
 
     switch (c.op) {
         .group, .timer, .async, .work => unreachable, // Managed by the loop
@@ -706,7 +788,7 @@ pub fn poll(self: *Self, state: *LoopState, timeout: Duration) !bool {
             iter = completion.next;
 
             // Skip if already completed (can happen with cancellations)
-            if (completion.state == .completed or completion.state == .dead) {
+            if (completion.loadState().phase != .running) {
                 continue;
             }
 
@@ -736,7 +818,7 @@ fn handleEpollError(event: *const std.os.linux.epoll_event, comptime errnoToErro
 
     const sock_err = net.getSockError(eventFd(event)) catch return error.Unexpected;
     if (sock_err == 0) return null; // No actual error, caller should retry operation
-    return errnoToError(@enumFromInt(sock_err));
+    return errnoToError(@fromBackingInt(@intCast(sock_err)));
 }
 
 pub fn checkCompletion(c: *Completion, event: *const std.os.linux.epoll_event) CheckResult {

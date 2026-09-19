@@ -6,6 +6,8 @@ const Allocator = std.mem.Allocator;
 const ev = @import("ev/root.zig");
 
 const Runtime = @import("runtime.zig").Runtime;
+const getCurrentExecutorOrNull = @import("runtime.zig").getCurrentExecutorOrNull;
+const syscall_cancel = @import("os/root.zig").syscall_cancel;
 const Awaitable = @import("awaitable.zig").Awaitable;
 const Closure = @import("task.zig").Closure;
 const finishTask = @import("task.zig").finishTask;
@@ -21,7 +23,13 @@ pub const AnyBlockingTask = struct {
     runtime: *Runtime,
     closure: Closure,
 
-    // Simple cancellation flag for blocking tasks
+    /// Bound by the pool worker around the task's function (via
+    /// `work.cancel_token`), so a `SIGURG` from `cancel()` can interrupt a
+    /// cancelable blocking syscall or `Waiter` park inside it.
+    token: syscall_cancel.Token = .{},
+
+    // Guards cancel(): only the first caller arms cancellation and takes the
+    // keep-alive ref.
     user_canceled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
 
     pub inline fn fromAwaitable(awaitable: *Awaitable) *AnyBlockingTask {
@@ -42,11 +50,36 @@ pub const AnyBlockingTask = struct {
         return result_ptr.*;
     }
 
-    /// Cancel this blocking task by setting canceled flag and canceling the thread pool work.
+    /// Request cancellation of this blocking task.
+    ///
+    /// Cancels the pool work (first `SIGURG`) and, if the worker is blocked in a
+    /// cancelable syscall, arms the current loop's resend so `tick` re-sends
+    /// until the worker acknowledges. A keep-alive ref is taken so the work (and
+    /// its token) cannot be freed while it may sit on the loop's resend list; it
+    /// is released via `onResendRelease` when the entry is dropped (or right away
+    /// when no resend is armed).
     pub fn cancel(self: *AnyBlockingTask) void {
-        self.user_canceled.store(true, .release);
-        // TODO: Actually cancel the task via thread pool
-        // self.runtime.thread_pool.cancel(&self.work);
+        // Only the first caller arms cancellation and takes the ref.
+        if (self.user_canceled.cmpxchgStrong(false, true, .acq_rel, .acquire) != null) return;
+
+        self.awaitable.ref_count.incr();
+        self.work.resend_release = onResendRelease;
+
+        if (getCurrentExecutorOrNull()) |exec| {
+            exec.loop.cancelWork(&self.work);
+        } else {
+            // Not on a loop thread, so there is no ticking loop here to drive the
+            // SIGURG resend: best-effort single signal, then drop the ref.
+            self.runtime.thread_pool.cancel(&self.work);
+            onResendRelease(&self.work);
+        }
+    }
+
+    /// Drop the keep-alive ref taken by `cancel()`. Runs on the loop thread when
+    /// the resend entry is dropped (or inline when no resend was armed).
+    fn onResendRelease(work: *ev.Work) void {
+        const self: *AnyBlockingTask = @fieldParentPtr("work", work);
+        self.awaitable.release();
     }
 
     pub inline fn getRuntime(self: *AnyBlockingTask) *Runtime {
@@ -92,6 +125,10 @@ pub const AnyBlockingTask = struct {
         self.work.completion_fn = threadPoolCompletion;
         self.work.completion_context = self;
 
+        // Bind the cancel token so the worker enters/exits it around the task's
+        // function, making cancelable syscalls (and Waiter parks) interruptible.
+        self.work.cancel_token = &self.token;
+
         // Copy context data into the allocation
         const context_dest = self.closure.getContextSlice(AnyBlockingTask, self);
         @memcpy(context_dest, context);
@@ -104,8 +141,10 @@ pub const AnyBlockingTask = struct {
 fn workFunc(work: *ev.Work) void {
     const task: *AnyBlockingTask = @ptrCast(@alignCast(work.userdata.?));
 
-    // Execute the user's blocking function
-    // ev handles cancellation - if canceled, this won't be called
+    // Execute the user's blocking function. Token-bearing work always runs; a
+    // cancellation is delivered by SIGURG interrupting a cancelable syscall (or
+    // Waiter park) inside the function, which surfaces as error.Canceled in the
+    // function's own result.
     task.closure.call(AnyBlockingTask, task);
 }
 
@@ -113,10 +152,10 @@ fn workFunc(work: *ev.Work) void {
 // All operations here must be thread-safe as this runs on a foreign thread.
 fn threadPoolCompletion(ctx: ?*anyopaque, work: *ev.Work) void {
     const task: *AnyBlockingTask = @ptrCast(@alignCast(ctx));
-
-    // TODO: Handle error case (work.c.err) when task was canceled
     _ = work;
 
+    // Cancellation, if any, was already delivered in-band as the function's
+    // error.Canceled result; nothing extra to do here beyond finishing.
     finishTask(task.runtime, &task.awaitable);
 }
 
@@ -143,6 +182,10 @@ fn registerBlockingTask(rt: *Runtime, task: *AnyBlockingTask) error{RuntimeShutd
 /// Spawn a blocking task with raw context bytes and start function.
 /// Used by Runtime.spawnBlocking and Group.spawnBlocking.
 /// Thread-safe: can be called from any thread.
+pub const SpawnOptions = struct {
+    reserve_thread: bool = false,
+};
+
 pub fn spawnBlockingTask(
     rt: *Runtime,
     result_len: usize,
@@ -151,6 +194,7 @@ pub fn spawnBlockingTask(
     context_alignment: std.mem.Alignment,
     start: Closure.Start,
     group: ?*Group,
+    options: SpawnOptions,
 ) !*AnyBlockingTask {
     const task = try AnyBlockingTask.create(
         rt,
@@ -162,13 +206,16 @@ pub fn spawnBlockingTask(
     );
     errdefer task.destroy();
 
-    if (group) |g| try registerGroupTask(g, &task.awaitable);
-    errdefer if (group) |g| unregisterGroupTask(g, &task.awaitable);
+    task.work.reserve_thread = options.reserve_thread;
 
-    // +1 ref for the caller (JoinHandle) before scheduling, to prevent
-    // race where task completes before caller can take ownership
+    // +1 ref before the task is reachable by anyone else, to prevent a race
+    // where it completes before the caller can take ownership. See spawnTask
+    // for why this has to come before registerGroupTask.
     task.awaitable.ref_count.incr();
     errdefer _ = task.awaitable.ref_count.decr();
+
+    if (group) |g| try registerGroupTask(g, &task.awaitable);
+    errdefer if (group) |g| unregisterGroupTask(g, &task.awaitable);
 
     try registerBlockingTask(rt, task);
 

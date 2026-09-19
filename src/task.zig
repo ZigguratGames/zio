@@ -17,6 +17,7 @@ const Group = @import("group.zig").Group;
 const registerGroupTask = @import("group.zig").registerGroupTask;
 const unregisterGroupTask = @import("group.zig").unregisterGroupTask;
 const os = @import("os/root.zig");
+const Timestamp = @import("time.zig").Timestamp;
 
 pub const Closure = struct {
     start: Start,
@@ -267,15 +268,24 @@ pub const AnyTask = struct {
     /// - `.reschedule`: Reschedule immediately (cooperative yielding).
     ///   The task state remains `.ready`.
     pub fn yield(self: *AnyTask, comptime mode: YieldMode, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
-        var executor = getCurrentExecutor();
+        return self.yieldFrom(getCurrentExecutor(), mode, cancel_mode);
+    }
+
+    /// Yield using the executor already resolved by the caller. `executor` is
+    /// valid only until the context switch; the resume path still reloads TLS
+    /// because the task may have migrated to another executor thread.
+    pub fn yieldFrom(self: *AnyTask, initial_executor: *Executor, comptime mode: YieldMode, comptime cancel_mode: Executor.YieldCancelMode) if (cancel_mode == .allow_cancel) Cancelable!void else void {
+        var executor = initial_executor;
 
         // Check and consume cancellation flag before yielding (unless no_cancel).
-        // On cancel: restore clean .ready state (clearing any awaken bit) before returning.
+        // On the cancel-error return, `state` must be left untouched: the tag is
+        // already .ready (we are running), and the awaken bit may hold a wake
+        // token set by a concurrent signal whose payload a cleanup path still
+        // has to observe (e.g. lockSlow's no_cancel wait for an in-flight
+        // signal). Clearing it here would strand that wake; a leftover token
+        // only costs one spurious reschedule at the next park.
         if (cancel_mode == .allow_cancel) {
-            self.checkCancel() catch |err| {
-                self.state.store(.{ .tag = .ready }, .release);
-                return err;
-            };
+            try self.checkCancel();
         }
 
         // Set up deferred cleanup — state transition happens after context is saved
@@ -375,11 +385,8 @@ pub const AnyTask = struct {
 
     /// Re-arm cancellation after it was acknowledged.
     /// This increments pending_errors so the next cancellation point returns error.Canceled.
-    /// Asserts that a cancellation source is still armed: either user
-    /// cancellation, or an auto-cancel whose flag has not been consumed by
-    /// AutoCancel.check yet (checkCancel consumes only the pending error, so
-    /// the flag is still set when a wait path re-arms a timeout-originated
-    /// cancellation).
+    /// Asserts that the task is under a cancellation, either user-requested or from a
+    /// live auto-cancel, so that a re-arm is always putting back a delivered error.
     pub fn recancel(self: *AnyTask) void {
         var current = self.canceled_status.load(.acquire);
         while (true) {
@@ -463,12 +470,24 @@ pub const AnyTask = struct {
         Executor.scheduleTask(self);
     }
 
+    /// Return the coroutine's stack to the pool and retire its TSan fiber.
+    ///
+    /// Both are owned by the coroutine, not by the task, so they are reclaimed
+    /// as soon as the coroutine is done rather than when the last reference to
+    /// the task goes away: the executor calls this from its finish cleanup,
+    /// once control has left the coroutine's stack. `destroy` calls it again
+    /// for tasks that were created but never ran. Idempotent, with a zeroed
+    /// `allocation_len` marking the resources as already released.
+    pub fn releaseCoro(self: *AnyTask, rt: *Runtime) void {
+        if (self.coro.context.stack_info.allocation_len == 0) return;
+        rt.stack_pool.release(self.coro.context.stack_info);
+        self.coro.context.stack_info.allocation_len = 0;
+        self.coro.deinit();
+    }
+
     pub fn destroy(self: *AnyTask) void {
         const rt = self.getRuntime();
-        if (self.coro.context.stack_info.allocation_len > 0) {
-            rt.stack_pool.release(self.coro.context.stack_info, rt.now());
-            self.coro.deinit();
-        }
+        self.releaseCoro(rt);
 
         self.closure.free(AnyTask, rt, self);
     }
@@ -744,13 +763,18 @@ pub fn spawnTask(
     );
     errdefer task.destroy();
 
-    if (group) |g| try registerGroupTask(g, &task.awaitable);
-    errdefer if (group) |g| unregisterGroupTask(g, &task.awaitable);
-
-    // +1 ref for the caller (JoinHandle) before scheduling, to prevent
-    // race where task completes before caller can take ownership
+    // +1 ref before the task is reachable by anyone else, to prevent a race
+    // where it completes before the caller can take ownership. For a task with
+    // a JoinHandle this is the caller's ref; for a group task, which returns no
+    // handle, it is the group's, dropped by unregisterGroupTask or by cancel
+    // popping the node. Taking it before registerGroupTask matters: once the
+    // node is in the group's list, a concurrent cancel() can pop it and release,
+    // and with no ref of our own that would free the task under us.
     task.awaitable.ref_count.incr();
     errdefer _ = task.awaitable.ref_count.decr();
+
+    if (group) |g| try registerGroupTask(g, &task.awaitable);
+    errdefer if (group) |g| unregisterGroupTask(g, &task.awaitable);
 
     try registerTask(rt, task);
 

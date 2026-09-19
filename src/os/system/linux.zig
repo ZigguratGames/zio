@@ -219,11 +219,40 @@ pub fn madvise(addr: [*]const u8, len: usize, advice: u32) usize {
     return linux.syscall3(.madvise, @intFromPtr(addr), len, advice);
 }
 
+/// ThreadSanitizer learns that a range of address space was recycled only
+/// through its libc `mmap`/`munmap` interceptors, which reset the shadow memory
+/// for the range. Raw syscalls are invisible to it, so an address the kernel
+/// hands back to a later `mmap` keeps the shadow of its previous mapping, and
+/// TSan reports races between two coroutine stacks that merely landed on the
+/// same address. Route those two calls through libc when instrumented.
+///
+/// Nothing else needs it: the `mprotect` interceptor does not touch shadow
+/// memory on Linux, and `madvise` has no interceptor at all, which is harmless
+/// because memory kept in the stack pool never leaves the process and its reuse
+/// is ordered by the pool mutex.
+const route_mmap_through_libc = builtin.sanitize_thread and builtin.link_libc;
+
+/// Convert a failed libc call into the negative-errno encoding that the raw
+/// syscall wrappers in this file return.
+fn libcErrnoReturn() usize {
+    return @bitCast(-@as(isize, std.c._errno().*));
+}
+
 pub fn munmap(addr: [*]const u8, len: usize) usize {
+    if (route_mmap_through_libc) {
+        const rc = std.c.munmap(@ptrCast(@alignCast(addr)), len);
+        return if (rc == 0) 0 else libcErrnoReturn();
+    }
     return linux.syscall2(.munmap, @intFromPtr(addr), len);
 }
 
 pub fn mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i64) usize {
+    if (route_mmap_through_libc) {
+        const res = std.c.mmap(@ptrCast(@alignCast(addr)), len, @bitCast(prot), @bitCast(flags), fd, @intCast(offset));
+        // libc reports failure as MAP_FAILED, which is (void *)-1
+        if (@intFromPtr(res) == @as(usize, @bitCast(@as(isize, -1)))) return libcErrnoReturn();
+        return @intFromPtr(res);
+    }
     if (@hasField(linux.SYS, "mmap2")) {
         return linux.syscall6(
             .mmap2,
@@ -247,9 +276,13 @@ pub fn mmap(addr: ?[*]u8, len: usize, prot: u32, flags: u32, fd: i32, offset: i6
     }
 }
 
-pub fn lseek(fd: i32, offset: off_t, whence: u32) usize {
+/// Returns 0 on success, or the negative errno on failure. The resulting file
+/// position is reported through `new_offset`, because it does not fit in the
+/// return value on 32-bit platforms.
+pub fn lseek(fd: i32, offset: off_t, whence: u32, new_offset: ?*u64) usize {
     if (@sizeOf(usize) == 4) {
-        // 32-bit platforms use llseek which returns result via pointer
+        // 32-bit platforms use llseek, which returns 0 on success and reports
+        // the resulting position through a pointer.
         var result: u64 = undefined;
         const rc = linux.syscall5(
             .llseek,
@@ -259,11 +292,9 @@ pub fn lseek(fd: i32, offset: off_t, whence: u32) usize {
             @intFromPtr(&result),
             whence,
         );
-        if (rc == 0) {
-            return @truncate(result); // TODO: do not truncate
-        } else {
-            return @bitCast(@as(isize, -1));
-        }
+        if (rc != 0) return rc;
+        if (new_offset) |out| out.* = result;
+        return 0;
     } else {
         const rc = linux.syscall3(
             .lseek,
@@ -271,7 +302,9 @@ pub fn lseek(fd: i32, offset: off_t, whence: u32) usize {
             @as(usize, @bitCast(offset)),
             whence,
         );
-        return rc;
+        if (errno(rc) != .SUCCESS) return rc;
+        if (new_offset) |out| out.* = rc;
+        return 0;
     }
 }
 
@@ -320,8 +353,8 @@ pub fn sigaction(sig: SIG, act: ?*const Sigaction, oact: ?*Sigaction) usize {
     };
     if (!needs_padding) return linux.sigaction(sig, act, oact);
 
-    std.debug.assert(@intFromEnum(sig) > 0);
-    std.debug.assert(@intFromEnum(sig) < linux.NSIG);
+    std.debug.assert(@backingInt(sig) > 0);
+    std.debug.assert(@backingInt(sig) < linux.NSIG);
     std.debug.assert(sig != .KILL);
     std.debug.assert(sig != .STOP);
 
@@ -352,7 +385,7 @@ pub fn sigaction(sig: SIG, act: ?*const Sigaction, oact: ?*Sigaction) usize {
 
     const result = linux.syscall4(
         .rt_sigaction,
-        @intFromEnum(sig),
+        @backingInt(sig),
         ksa_arg,
         oldksa_arg,
         @sizeOf(sigset_t),

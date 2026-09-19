@@ -119,7 +119,6 @@ fn fillBuffers(
                 if (i >= storage.len) return i;
                 const name_slice = std.mem.sliceTo(name_ptr, 0);
                 const len = std.unicode.utf16LeToUtf8(cname_buf, name_slice) catch return error.UnknownHostName;
-                cname_buf[len] = 0;
                 storage[i] = .{ .canonical_name = .{ .bytes = cname_buf[0..len] } };
                 i += 1;
             }
@@ -130,7 +129,7 @@ fn fillBuffers(
     while (current) |info| : (current = info.ai_next) {
         const addr = info.ai_addr orelse continue;
         if (addr.family != os_net.AF.INET and addr.family != os_net.AF.INET6) continue;
-        if (i >= storage.len) return error.TooManyAddresses;
+        if (i >= storage.len) break;
         storage[i] = .{ .address = dns.IpAddress.initPosix(@ptrCast(addr), @intCast(info.ai_addrlen)) };
         i += 1;
     }
@@ -139,7 +138,7 @@ fn fillBuffers(
 }
 
 fn winsockToLookupError(err: i32) dns.LookupError {
-    const wsa_err: windows.WinsockError = @enumFromInt(@as(u16, @intCast(err)));
+    const wsa_err: windows.WinsockError = @fromBackingInt(@intCast(@as(u16, @intCast(err))));
     return switch (wsa_err) {
         .EAFNOSUPPORT => error.AddressFamilyUnsupported,
         .EINVAL => error.Unexpected,

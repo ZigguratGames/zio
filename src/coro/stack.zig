@@ -38,7 +38,7 @@ pub fn stackAlloc(info: *StackInfo, maximum_size: usize, committed_size: usize) 
         try stackAllocPosix(info, maximum_size, committed_size);
     }
 
-    if (builtin.mode == .Debug and builtin.valgrind_support) {
+    if (builtin.mode == .debug and builtin.valgrind_support) {
         const stack_slice: [*]u8 = @ptrFromInt(info.limit);
         info.valgrind_stack_id = std.valgrind.stackRegister(stack_slice[0 .. info.base - info.limit]);
     }
@@ -49,6 +49,12 @@ fn stackAllocPosix(info: *StackInfo, maximum_size: usize, committed_size: usize)
     const aligned_max = std.mem.alignForward(usize, maximum_size, page_size);
     // Ensure we allocate at least 2 pages (guard + usable space)
     const size = @max(aligned_max + page_size, page_size * 2);
+
+    // OpenBSD needs a different allocation strategy entirely (MAP_STACK, fully
+    // committed up front, no on-demand growth). See stackAllocOpenBSD.
+    if (builtin.os.tag == .openbsd) {
+        return stackAllocOpenBSD(info, size);
+    }
 
     // Reserve address space with PROT_NONE
     // On NetBSD/FreeBSD, we must declare future permissions upfront for security policies
@@ -82,8 +88,10 @@ fn stackAllocPosix(info: *StackInfo, maximum_size: usize, committed_size: usize)
 
     // Guard page stays as PROT_NONE (first page)
 
-    // Round committed size up to page boundary
-    const commit_size = std.mem.alignForward(usize, committed_size, page_size);
+    // Round committed size up to page boundary; commit at least one page so
+    // the owner-tag word below and the pool's FreeNode always have committed
+    // memory to live in.
+    const commit_size = @max(std.mem.alignForward(usize, committed_size, page_size), page_size);
 
     // Validate that committed size doesn't exceed available space (minus guard page)
     if (commit_size > size - page_size) {
@@ -103,17 +111,161 @@ fn stackAllocPosix(info: *StackInfo, maximum_size: usize, committed_size: usize)
     // Stack layout (grows downward from high to low addresses):
     // [guard_page (PROT_NONE)][uncommitted (PROT_NONE)][committed (READ|WRITE)]
     // ^                                                ^                       ^
-    // allocation_ptr                                   limit                   base (allocation_ptr + allocation_len)
+    // allocation_ptr                                   limit                   base (top - tag reserve)
+    // The topmost 16 bytes above base hold the pool's owner tag (see
+    // stackWriteOwnerTag); an individually mapped stack tags itself 0.
     info.* = .{
         .allocation_ptr = allocation.ptr,
-        .base = stack_top,
+        .base = stack_top - owner_tag_reserve,
         .limit = initial_commit_start,
+        .allocation_len = allocation.len,
+    };
+    stackWriteOwnerTag(info.*, 0);
+}
+
+/// Bytes reserved above `base` at the very top of every POSIX stack for the
+/// pool's owner tag (the slab a slot was carved from, or 0 for an individual
+/// mapping). The coroutine's stack pointer starts at `base` and grows down,
+/// so the tag survives the coroutine's whole lifetime, and 16 bytes keeps
+/// `base` 16-byte aligned. Lets the pool find a released stack's slab with
+/// one read instead of scanning the slab chain.
+pub const owner_tag_reserve = 16;
+
+pub fn stackWriteOwnerTag(info: StackInfo, tag: usize) void {
+    const tag_ptr: *usize = @ptrFromInt(@intFromPtr(info.allocation_ptr) + info.allocation_len - 8);
+    tag_ptr.* = tag;
+}
+
+pub fn stackReadOwnerTag(info: StackInfo) usize {
+    const tag_ptr: *const usize = @ptrFromInt(@intFromPtr(info.allocation_ptr) + info.allocation_len - 8);
+    return tag_ptr.*;
+}
+
+/// Allocate a coroutine stack on OpenBSD.
+///
+/// OpenBSD enforces that the stack pointer always lies within a region mapped
+/// with MAP_STACK: on every system call and trap the kernel checks the stack
+/// pointer and kills the process if it points outside such a region. This is
+/// incompatible with the PROT_NONE-reserve + mprotect-on-fault growth scheme
+/// used on other POSIX systems, because:
+///   - MAP_STACK can only be established at mmap time (mprotect cannot add it),
+///     so pages committed lazily via mprotect would not be MAP_STACK, and
+///   - MAP_STACK requires PROT_READ|PROT_WRITE, so the reservation cannot start
+///     out as PROT_NONE.
+///
+/// So on OpenBSD we map the whole usable stack as RW|MAP_STACK, fully committed
+/// up front (pages are still demand-zeroed by the kernel, so this reserves
+/// address space, not physical memory), and carve a single PROT_NONE guard page
+/// at the low end for overflow detection. There is no on-demand growth: a stack
+/// overflow faults on the guard page and crashes (no SIGSEGV growth handler is
+/// installed, see setupStackGrowth).
+fn stackAllocOpenBSD(info: *StackInfo, size: usize) error{OutOfMemory}!void {
+    const allocation = posix.mmap(
+        null,
+        size,
+        posix.PROT.READ | posix.PROT.WRITE,
+        posix.MAP.PRIVATE | posix.MAP.ANONYMOUS | posix.MAP.STACK,
+        -1,
+        0,
+    ) catch |err| {
+        log.err("Failed to mmap OpenBSD stack memory (size={d}): {}", .{ size, err });
+        return error.OutOfMemory;
+    };
+    errdefer posix.munmap(allocation) catch {};
+
+    // Turn the lowest page into a PROT_NONE guard page. The rest of the mapping
+    // keeps its MAP_STACK flag, so the stack pointer stays valid for syscalls.
+    const guard: [*]align(page_size) u8 = allocation.ptr;
+    posix.mprotect(guard[0..page_size], posix.PROT.NONE) catch |err| {
+        log.err("Failed to mprotect OpenBSD stack guard page: {}", .{err});
+        return error.OutOfMemory;
+    };
+
+    // Stack layout (grows downward): [guard_page (PROT_NONE)][committed (READ|WRITE)]
+    // The whole usable region is committed, so limit sits just above the guard page.
+    const alloc_base = @intFromPtr(allocation.ptr);
+    info.* = .{
+        .allocation_ptr = allocation.ptr,
+        .base = alloc_base + size,
+        .limit = alloc_base + page_size,
         .allocation_len = allocation.len,
     };
 }
 
+/// Reserve one slab arena: a PROT_NONE address-space reservation that stack
+/// slots are carved out of, with its first page committed for the slab
+/// header. Pages between and below slots stay PROT_NONE, so guard pages cost
+/// nothing extra. POSIX-only (the slab pool is comptime-disabled elsewhere);
+/// OpenBSD is excluded because MAP_STACK cannot start as PROT_NONE.
+pub fn slabReserve(len: usize) error{OutOfMemory}![]align(page_size) u8 {
+    const prot_flags = posix.PROT.NONE | posix.PROT.MAX(posix.PROT.READ | posix.PROT.WRITE);
+    var map_flags = posix.MAP.PRIVATE | posix.MAP.ANONYMOUS;
+    if (builtin.os.tag == .linux or builtin.os.tag == .netbsd) {
+        map_flags |= posix.MAP.STACK;
+    }
+
+    const allocation = posix.mmap(null, len, prot_flags, map_flags, -1, 0) catch |err| {
+        log.err("Failed to mmap stack slab (size={d}): {}", .{ len, err });
+        return error.OutOfMemory;
+    };
+    errdefer posix.munmap(allocation) catch {};
+
+    // One madvise for the whole slab instead of one per stack.
+    if (@hasDecl(posix.MADV, "NOHUGEPAGE")) {
+        posix.madvise(allocation, posix.MADV.NOHUGEPAGE) catch {};
+    }
+
+    // Commit the header page for the slab bookkeeping.
+    posix.mprotect(allocation.ptr[0..page_size], posix.PROT.READ | posix.PROT.WRITE) catch |err| {
+        log.err("Failed to commit stack slab header page: {}", .{err});
+        return error.OutOfMemory;
+    };
+
+    return allocation;
+}
+
+pub fn slabFree(mem: []align(page_size) u8) void {
+    posix.munmap(mem) catch {};
+}
+
+/// Initialize a stack inside a slab slot: commit the initial region at the
+/// top and leave everything below it (including the slot's first page, the
+/// guard) as the slab's PROT_NONE reservation. The resulting StackInfo has
+/// exactly the layout stackAllocPosix produces, so growth, overflow
+/// detection, and pooling treat both kinds identically. One mprotect per
+/// cold slot; a recycled slot pays no syscalls at all.
+pub fn stackInitSlot(info: *StackInfo, slot: []align(page_size) u8, committed_size: usize, owner_tag: usize) error{OutOfMemory}!void {
+    // Commit at least one page so the pool's FreeNode always fits.
+    const commit_size = @max(std.mem.alignForward(usize, committed_size, page_size), page_size);
+    if (commit_size > slot.len - page_size) {
+        log.err("Committed size ({d}) exceeds slab slot size ({d})", .{ commit_size, slot.len });
+        return error.OutOfMemory;
+    }
+
+    const stack_top = @intFromPtr(slot.ptr) + slot.len;
+    const initial_commit_start = stack_top - commit_size;
+    const initial_region: [*]align(page_size) u8 = @ptrFromInt(initial_commit_start);
+    posix.mprotect(initial_region[0..commit_size], posix.PROT.READ | posix.PROT.WRITE) catch |err| {
+        log.err("Failed to commit slab stack slot (commit_size={d}): {}", .{ commit_size, err });
+        return error.OutOfMemory;
+    };
+
+    info.* = .{
+        .allocation_ptr = slot.ptr,
+        .base = stack_top - owner_tag_reserve,
+        .limit = initial_commit_start,
+        .allocation_len = slot.len,
+    };
+    stackWriteOwnerTag(info.*, owner_tag);
+
+    if (builtin.mode == .debug and builtin.valgrind_support) {
+        const stack_slice: [*]u8 = @ptrFromInt(info.limit);
+        info.valgrind_stack_id = std.valgrind.stackRegister(stack_slice[0 .. info.base - info.limit]);
+    }
+}
+
 pub fn stackFree(info: StackInfo) void {
-    if (builtin.mode == .Debug and builtin.valgrind_support) {
+    if (builtin.mode == .debug and builtin.valgrind_support) {
         if (info.valgrind_stack_id != 0) {
             std.valgrind.stackDeregister(info.valgrind_stack_id);
         }
@@ -168,7 +320,7 @@ pub fn stackExtend(info: *StackInfo, mode: StackExtendMode) error{StackOverflow}
         try stackExtendPosix(info, mode);
     }
 
-    if (builtin.mode == .Debug and builtin.valgrind_support) {
+    if (builtin.mode == .debug and builtin.valgrind_support) {
         if (info.valgrind_stack_id != 0) {
             const stack_slice: [*]u8 = @ptrFromInt(info.limit);
             std.valgrind.stackChange(info.valgrind_stack_id, stack_slice[0 .. info.base - info.limit]);
@@ -180,6 +332,10 @@ pub fn stackExtend(info: *StackInfo, mode: StackExtendMode) error{StackOverflow}
 /// Mode .grow: Grow by 1.5x current size in 64KB chunks
 /// Mode .full: Commit all remaining uncommitted stack
 fn stackExtendPosix(info: *StackInfo, mode: StackExtendMode) error{StackOverflow}!void {
+    // OpenBSD stacks are fully committed at allocation time (MAP_STACK regions
+    // cannot be grown via mprotect), so there is nothing to extend.
+    if (builtin.os.tag == .openbsd) return;
+
     const guard_end = @intFromPtr(info.allocation_ptr) + page_size;
 
     // Calculate new limit based on mode
@@ -253,7 +409,7 @@ fn stackAllocWindows(info: *StackInfo, maximum_size: usize, committed_size: usiz
     );
 
     if (status != .SUCCESS) {
-        log.err("RtlCreateUserStack failed with status: 0x{x}", .{@intFromEnum(status)});
+        log.err("RtlCreateUserStack failed with status: 0x{x}", .{@backingInt(status)});
         return error.OutOfMemory;
     }
 
@@ -291,8 +447,11 @@ fn stackExtendWindows(_: *StackInfo) error{StackOverflow}!void {
 ///
 /// Must be called once per thread before using coroutines on that thread.
 pub fn setupStackGrowth() !void {
-    // Windows handles stack growth automatically
-    if (builtin.os.tag == .windows) return;
+    // Windows handles stack growth automatically via PAGE_GUARD.
+    // OpenBSD stacks are fully committed at allocation time (MAP_STACK cannot be
+    // grown on demand), so there is no growth handler to install; an overflow
+    // faults on the guard page and crashes.
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
 
     const altstack_size = posix.SIGSTKSZ;
 
@@ -339,8 +498,8 @@ pub fn setupStackGrowth() !void {
 ///
 /// Should be called when a thread exits if setupStackGrowth() was called.
 pub fn cleanupStackGrowth() void {
-    // Windows has nothing to clean up
-    if (builtin.os.tag == .windows) return;
+    // Windows and OpenBSD install no growth handler / alternate stack.
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return;
 
     if (altstack_installed) {
         // Disable alternate stack
@@ -380,6 +539,7 @@ inline fn getFaultAddress(info: *const posix.siginfo_t) usize {
         .macos, .ios, .tvos, .watchos, .visionos => info.addr,
         .freebsd, .dragonfly => info.addr,
         .netbsd => info.info.reason.fault.addr,
+        .openbsd => info.data.fault.addr,
         .illumos => info.reason.fault.addr,
         else => @compileError("Stack growth not supported on this platform"),
     });
@@ -507,11 +667,12 @@ test "Stack: alloc/free" {
     // Verify base is at the top (high address)
     try std.testing.expect(stack.base > stack.limit);
 
-    // Verify at least the requested amount was committed
+    // Verify at least the requested amount was committed (minus the owner
+    // tag reserve, which lives in committed memory above `base` on POSIX).
     // Note: RtlCreateUserStack on Windows may commit more than requested
     const commit_size_rounded = std.mem.alignForward(usize, committed_size, page_size);
     const actual_committed = stack.base - stack.limit;
-    try std.testing.expect(actual_committed >= commit_size_rounded);
+    try std.testing.expect(actual_committed + owner_tag_reserve >= commit_size_rounded);
 
     // Verify base is at the top of the allocation
     try std.testing.expect(stack.base >= @intFromPtr(stack.allocation_ptr));
@@ -534,8 +695,9 @@ test "Stack: fully committed" {
 }
 
 test "Stack: extend" {
-    // Skip on Windows - RtlCreateUserStack handles automatic growth
-    if (builtin.os.tag == .windows) return error.SkipZigTest;
+    // Skip on Windows - RtlCreateUserStack handles automatic growth.
+    // Skip on OpenBSD - stacks are fully committed at allocation time.
+    if (builtin.os.tag == .windows or builtin.os.tag == .openbsd) return error.SkipZigTest;
 
     const maximum_size = 256 * 1024;
     const initial_commit = 64 * 1024;

@@ -12,7 +12,9 @@ const os = @import("os/root.zig");
 const ev = @import("ev/root.zig");
 const Runtime = @import("runtime.zig").Runtime;
 const getCurrentExecutor = @import("runtime.zig").getCurrentExecutor;
-const Waiter = @import("common.zig").Waiter;
+const loopClearTimer = @import("runtime.zig").loopClearTimer;
+const common = @import("common.zig");
+const Waiter = common.Waiter;
 
 // Time configuration - adjust these for different platforms
 const TimePrecision = enum { nanoseconds, microseconds, milliseconds };
@@ -548,12 +550,29 @@ pub const Timeout = union(enum) {
     pub const WaitContext = struct {
         timer: ev.Timer = ev.Timer.init(.{ .duration = .zero }),
         waiter: ?*Waiter = null,
+        fired: std.atomic.Value(bool) = .init(false),
     };
 
-    pub fn asyncWait(self: *const Timeout, waiter: *Waiter, ctx: *WaitContext) bool {
+    pub fn asyncWait(self: *const Timeout, waiter: *Waiter, ctx: *WaitContext) common.AsyncWaitState {
         // Timeout.none means wait forever - never completes
         if (self.* == .none) {
-            return true;
+            return .queued;
+        }
+
+        if (ctx.waiter != null) {
+            // Re-poll of an armed timer: never re-arm. If the timer fired
+            // while the select's sweep held its commit fence, the callback's
+            // signal claimed nothing; the latch lets us claim the win now.
+            if (ctx.fired.load(.acquire)) {
+                return switch (waiter.tryClaim()) {
+                    // The callback signals on every dispatch, so that signal
+                    // must be accounted for.
+                    .won => .ready_signaled,
+                    .busy => unreachable,
+                    .lost => .decided,
+                };
+            }
+            return .queued;
         }
 
         ctx.timer = ev.Timer.init(self.*);
@@ -566,24 +585,31 @@ pub const Timeout = union(enum) {
         ctx.timer.c.flags = .{ .defer_callback = false };
 
         const executor = getCurrentExecutor();
-        executor.loop.add(&ctx.timer.c);
-        return true;
+        executor.loopAdd(&ctx.timer.c);
+        return .queued;
     }
 
     fn timerCallback(_: *ev.Loop, c: *ev.Completion) void {
         const ctx: *WaitContext = @ptrCast(@alignCast(c.userdata.?));
-        if (ctx.waiter) |waiter| {
-            waiter.signal();
-        }
+        // Publish the fired latch before signaling: a re-poll that consumed
+        // this signal as a fence-window wake finds the latch and claims the
+        // win it carries.
+        ctx.fired.store(true, .release);
+        // Every dispatch signals: the wait protocol keeps `ctx` alive until the
+        // signal arrives whenever `asyncCancelWait` reported the timer as still
+        // completing, so a missed signal would park the waiter forever.
+        ctx.waiter.?.signal();
     }
 
     pub fn asyncCancelWait(self: *const Timeout, waiter: *Waiter, ctx: *WaitContext) bool {
         _ = self;
         _ = waiter;
-        const loop = ctx.timer.c.loop orelse return true;
-        ctx.waiter = null; // Prevent callback from waking a stale/reused waiter
-        loop.clearTimer(&ctx.timer);
-        return true; // Timer operations don't have values to re-add if we lost the race
+        // `.none` never arms a timer, so there is nothing to remove.
+        const loop = ctx.timer.c.getLoop() orelse return true;
+        // Disarmed: no callback, no signal. Otherwise the timer is completing
+        // and its callback still signals `ctx.waiter`, so report the wake as
+        // in flight and let the caller wait for it.
+        return loopClearTimer(loop, &ctx.timer);
     }
 
     pub fn getResult(self: *const Timeout, ctx: *WaitContext) void {
