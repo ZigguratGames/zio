@@ -3,7 +3,6 @@
 
 const std = @import("std");
 const net = @import("../../net.zig");
-const log = @import("../../common.zig").log;
 
 /// /etc/hosts parser.
 ///
@@ -35,10 +34,10 @@ pub const Hosts = struct {
 
             var fields = std.mem.splitAny(u8, trimmed, " \t");
             const addr_str = fields.next() orelse continue;
-            const addr = net.IpAddress.parseIp(addr_str, 0) catch |err| {
-                log.warn("hosts: invalid address '{s}': {}", .{ addr_str, err });
-                continue;
-            };
+            // Lines that are not "address name" pairs are system noise a
+            // resolver should skip quietly — glibc does the same — rather
+            // than warn about on every parse.
+            const addr = net.IpAddress.parseIp(addr_str, 0) catch continue;
 
             while (fields.next()) |name| {
                 if (name.len == 0) continue;
