@@ -9,6 +9,8 @@ ZIO is an asynchronous runtime for Zig, in the same spirit as Go's runtime or To
 
 > The main branch is for Zig 0.16 . For Zig master (0.17+), use the [`zig-0.17`](https://github.com/lalinsky/zio/tree/zig-0.17) branch.
 
+> This fork is maintained by Ziggurat Games. Please report bugs and issues in the [Ziggurat issue tracker](https://github.com/ZigguratGames/ziggurat/issues/new), not in the upstream [lalinsky/zio](https://github.com/lalinsky/zio) repository.
+
 [`std.Io`]: https://ziglang.org/documentation/0.16.0/std/#std.Io
 
 ## Architecture
