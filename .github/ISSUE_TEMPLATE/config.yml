@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a bug
+    url: https://github.com/ZigguratGames/ziggurat/issues/new
+    about: This fork is maintained by Ziggurat Games — please file bug reports in the Ziggurat repository.
